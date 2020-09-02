@@ -15,6 +15,11 @@
 # ==============================================================================
 """Common utilities."""
 
+# ==============================================================================
+# Note: Avoid adding dependencies to py_utils beyond standard python packages
+#       and tensorflow.
+# ==============================================================================
+
 import collections as py_collections
 import contextlib
 import functools
@@ -37,13 +42,13 @@ from lingvo.core import tshape
 import numpy as np
 import six
 
-from model_pruning.python import pruning
 # pylint: disable=g-direct-tensorflow-import
 from tensorflow.core.framework import node_def_pb2
 from tensorflow.core.protobuf import rewriter_config_pb2
 from tensorflow.python.framework import func_graph
 from tensorflow.python.framework import function
 from tensorflow.python.ops import init_ops
+from tensorflow.python.tpu import topology as tf_topology
 from tensorflow.python.tpu import tpu_function
 from tensorflow.python.util import deprecation
 # pylint: enable=g-direct-tensorflow-import
@@ -72,6 +77,11 @@ tf.flags.DEFINE_bool(
     'or consumed by TPU')
 
 tf.flags.DEFINE_bool(
+    'tflite_compatible', False,
+    'Uses tflite converter-friendly ops at applicable places. This so far '
+    '(08/2020) is a only best-effort option.')
+
+tf.flags.DEFINE_bool(
     'pin_vars_to_cpu', False,
     'Pin variables to cpu:0.  This is useful for weight-sharing / multi-core '
     'inference on TPUs in which TPU core variables are managed via '
@@ -91,6 +101,8 @@ tf.flags.DEFINE_bool('if_use_tf_function', False,
                      'If True use tf.function for py_utils.If().')
 tf.flags.DEFINE_bool('while_loop_use_tf_function', False,
                      'If True use tf.function for py_utils.WhileLoop().')
+tf.flags.DEFINE_bool('call_defun_use_tf_function', False,
+                     'If True use tf.function for py_utils.CallDefun().')
 
 # NOTE: Using absl flags in libraries are frowned upon for several reasons:
 #
@@ -235,6 +247,24 @@ def assert_even_divide(denorm, num):  # pylint: disable=invalid-name
 
   quo = denorm // num
   return assert_equal(quo * num, denorm)
+
+
+def AssertIdShape(expected_ids_shape_pattern, ids_shape, *args):
+  """Asserts shape expected_ids_shape_pattern matches all other input shapes."""
+
+  def AssertFn(inputs):
+    dependencies = [
+        assert_shape_match(inputs.ids_shape, inputs.expected_ids_shape_pattern)
+    ] + [
+        assert_shape_match(inputs.ids_shape, x_shape) for x_shape in inputs.args
+    ]
+    return with_dependencies(dependencies, inputs.ids_shape)
+
+  inputs = NestedMap(
+      expected_ids_shape_pattern=expected_ids_shape_pattern,
+      ids_shape=ids_shape,
+      args=args)
+  return CallDefun(AssertFn, Transform(tf.convert_to_tensor, inputs))
 
 
 def _CheckNumerics(x, message=None, *args, **kwargs):
@@ -456,32 +486,6 @@ def GetRank(tensor):
     return tf.rank(tensor)  # Tensor
 
 
-def HasShape(tensor, expected_shape, ndims=None):
-  """Syntactic sugar for asserting that tensor has the expected shape.
-
-  Args:
-    tensor: A Tensor.
-    expected_shape: A Python list or a 1D tensor.
-    ndims: If not None, check only the first `ndims` dimensions of `tensor`.
-      Must be equal to the length of `expected_shape` if not None.
-
-  Returns:
-    The input `tensor`
-  Raises:
-    A runtime error if the assertion fails.
-  """
-  if _FromGlobal('enable_asserts'):
-    filepath, line, func, _ = traceback.extract_stack(limit=3)[-2]
-    msg = 'LINGVO ASSERT %s:%s(%s)' % (re.sub(r'.*/', '',
-                                                 filepath), line, func)
-    return with_dependencies([
-        ops.assert_shape_match(
-            tf.shape(tensor)[:ndims], expected_shape, msg=msg)
-    ], tensor)
-  else:
-    return tensor
-
-
 def GetShape(tensor, ndims=None):
   """Returns tensor's shape as a list which can be unpacked, unlike tf.shape.
 
@@ -517,12 +521,120 @@ def GetShape(tensor, ndims=None):
   return shapes
 
 
+def HasShape(tensor, expected_shape, ndims=None):
+  """Syntactic sugar for asserting that tensor has the expected shape.
+
+  Args:
+    tensor: A Tensor.
+    expected_shape: A Python list or a 1D tensor. Elements of expected_shape can
+      be -1 which indicate that any size is valid for that dimension.
+    ndims: If not None, check only the first `ndims` dimensions of `tensor`.
+      Must be equal to the length of `expected_shape` if not None.
+
+  Returns:
+    The input `tensor` with control dependencies that will raise a runtime
+    error if dynamic shape checks fail.
+
+  Raises:
+    ValueError: A value error if the assertion fails at static shape checks.
+  """
+  if not _FromGlobal('enable_asserts'):
+    return tensor
+
+  filepath, line, func, _ = traceback.extract_stack(limit=3)[-2]
+  msg = 'LINGVO ASSERT %s:%s(%s)' % (re.sub(r'.*/', '',
+                                               filepath), line, func)
+
+  tensor_shape = GetShape(tensor)
+  if ndims is not None:
+    tensor_shape = tensor_shape[:ndims]
+
+  # TODO(jngiam): Attempt to switch back to tf.Assert after it has better
+  # support on GPUs.
+  assert_op = ops.assert_shape_match(tensor_shape, expected_shape, msg=msg)
+
+  # If expected_shape is a Tensor, then we are unable to perform static checks.
+  # In this case, we can do a dynamic check and return.
+  if isinstance(expected_shape, tf.Tensor):
+    return with_dependencies([assert_op], tensor)
+
+  # Infer ranks from the inputs.
+  expected_rank = len(expected_shape)
+  if isinstance(tensor_shape, tf.Tensor):
+    tensor_rank = tensor.shape.ndims
+  else:
+    tensor_rank = len(tensor_shape)
+
+  # If ndims is None, then either one of the ranks should not be None, or they
+  # should both match. If both ranks are None, then they are both tensors and
+  # should be caught by the earlier short-circuit.
+  if ndims is None:
+    if (tensor_rank is not None) and (expected_rank != tensor_rank):
+      raise ValueError('Tensor does not match rank of expected shape.\n'
+                       'Tensor shape: {} Expected shape: {}'.format(
+                           tensor_shape, expected_shape))
+    # Both tensors can be assumed to be of same rank.
+    ndims = expected_rank
+  else:
+    if (tensor_rank is not None) and (tensor_rank < ndims):
+      raise ValueError('Tensor has fewer dimensions than ndims.\n'
+                       'Tensor shape: {} ndims: {}'.format(tensor_shape, ndims))
+    if expected_rank != ndims:
+      raise ValueError(
+          'Expected shape must have number of dimensions equal to ndims.\n'
+          'Expected shape: {} ndims: {}'.format(expected_shape, ndims))
+
+  # Ensure that both tensor_shape and expected_shape are both lists.
+  tensor_shape = tensor_shape[:ndims]
+  if isinstance(tensor_shape, tf.Tensor):
+    tensor_shape = tf.unstack(tensor_shape, num=ndims)
+
+  # Map tf.Dimension values to their held values.
+  tensor_shape = [
+      v.value if isinstance(v, tf.Dimension) else v for v in tensor_shape
+  ]
+  expected_shape = [
+      v.value if isinstance(v, tf.Dimension) else v for v in expected_shape
+  ]
+
+  all_static_checks = True
+  for idx, (dim, expected_dim) in enumerate(zip(tensor_shape, expected_shape)):
+    if expected_dim == -1:
+      continue
+    if isinstance(dim, tf.Tensor) or isinstance(expected_dim, tf.Tensor):
+      all_static_checks = False
+    elif dim != expected_dim:
+      raise ValueError('Tensor does not match expected shape on dimension {}.\n'
+                       'Tensor shape: {} Expected shape: {}'.format(
+                           idx, tensor_shape, expected_shape))
+
+  if all_static_checks:
+    return tf.convert_to_tensor(tensor)
+  else:
+    return with_dependencies([assert_op], tensor)
+
+
 def GetSize(tensor):
   shape = GetShape(tensor)
   if (isinstance(shape, tf.Tensor) or
       any([isinstance(x, tf.Tensor) for x in shape])):
     return tf.size(tensor)
   return np.prod(shape)
+
+
+def CausalSelfAttenPadding(seqlen, dtype):
+  """Wraps tf.linalg.band_part() for tflite compatibility."""
+  if FLAGS.tflite_compatible:
+    # [N, 1]
+    rows = tf.expand_dims(tf.range(seqlen), -1)
+    # [1, N]
+    cols = tf.expand_dims(tf.range(seqlen), 0)
+    row_cols = rows - cols
+    return tf.where(row_cols < 0, tf.ones([seqlen, seqlen], dtype),
+                    tf.zeros([seqlen, seqlen], tf.float32))
+  else:
+    return 1.0 - tf.linalg.band_part(
+        tf.ones([seqlen, seqlen], dtype=dtype), -1, 0)
 
 
 def use_xla():  # pylint: disable=invalid-name
@@ -956,6 +1068,10 @@ class NestedMap(dict):
     """Returns a copy of this `.NestedMap` with fn applied on each value."""
     return self._RecursiveMap(lambda _, v: fn(v))
 
+  def TransformWithKey(self, fn):
+    """Returns a copy of this `.NestedMap` with fn applied on each key/value."""
+    return self._RecursiveMap(fn)
+
   def IsCompatible(self, other):
     """Returns true if self and other are compatible.
 
@@ -1005,6 +1121,11 @@ class NestedMap(dict):
       prefix = 'nmap: '
     for l in self._ToStrings():
       tf.logging.vlog(level, '%s %s', prefix, l)
+
+  def __dir__(self):
+    """dir() that includes flattened keys in returned output."""
+    keys = self._RecursiveMap(lambda k, v: k, flatten=True)
+    return keys + super().__dir__()
 
 
 class _Unique:
@@ -1217,6 +1338,11 @@ class WeightInit:
     return WeightInit._Params('xavier', scale, seed)
 
   @staticmethod
+  def XavierGaussian(scale=1.0, seed=None):
+    """tf.random.normal(0, sqrt(2.0 / (in + out)))."""
+    return WeightInit._Params('xavier_gaussian', scale, seed)
+
+  @staticmethod
   def XavierWithFixupParams(scale=1.0,
                             depth=1.0,
                             layers_per_residual_block=1.0,
@@ -1318,9 +1444,10 @@ def DefaultParamInit():
   return WeightInit.Xavier(_DEFAULT_XAVIER_INIT)
 
 
+# TODO(rpang, jonathanasdf): explore adding _is_default to hyperparams.Param.
 def IsDefaultParamInit(p):
-  return (p.method == 'xavier' and p.scale == _DEFAULT_XAVIER_INIT and
-          p.seed is None)
+  return (p.method == 'xavier' and
+          abs(p.scale - _DEFAULT_XAVIER_INIT) < 1e-7 and p.seed is None)
 
 
 def WeightParams(shape, init=None, dtype=None, collections=None):
@@ -1599,9 +1726,7 @@ def CreateVariable(name,
       Accepted values are constants defined in the class tf.VariableAggregation.
 
   Returns:
-    tf.identity(var), var pair. The tf.identity() node is colocated
-    with var. In the case of FLAGS.no_identity_on_vars, simply returns
-    a var, var pair.
+    The created variable.
   """
   p = params.Copy()
   shape = tf.TensorShape(ToStaticShape(p.shape)).as_list()
@@ -1652,11 +1777,15 @@ def CreateVariable(name,
     _, fan_out = GetFanInFanOut(shape)
     if fan_out is not None:
       scale *= 1.0 / math.sqrt(fan_out)
+  if method == 'xavier_gaussian':
+    fan_in, fan_out = GetFanInFanOut(shape)
+    if fan_in is not None and fan_out is not None:
+      scale *= math.sqrt(2.0 / (fan_in + fan_out))
 
   init_dtype = p.dtype.real_dtype
   if method in [
       'gaussian', 'gaussian_sqrt_dim', 'gaussian_sqrt_fanin',
-      'gaussian_sqrt_fanout'
+      'gaussian_sqrt_fanout', 'xavier_gaussian'
   ]:
     v_init = init_ops.random_normal_initializer(
         mean=0.0, stddev=scale, seed=seed, dtype=init_dtype)
@@ -1672,7 +1801,7 @@ def CreateVariable(name,
   elif method in ['uniform_unit_scaling_fan_avg']:
     v_init = tf.variance_scaling_initializer(
         scale=scale,
-        model='fan_avg',
+        mode='fan_avg',
         distribution='uniform',
         seed=seed,
         dtype=init_dtype)
@@ -1744,7 +1873,7 @@ def CreateVariable(name,
       return next_creator(**kwargs)
     except ValueError:  # Possibly the variable already exists
       if GetOpportunisticVariableReuse():
-        with tf.variable_scope(tf.get_variable_scope(), reuse=True):
+        with tf.variable_scope(tf.get_variable_scope(), reuse=tf.AUTO_REUSE):
           return next_creator(**kwargs)
       else:
         raise
@@ -1793,13 +1922,7 @@ def CreateVariable(name,
             synchronization=synchronization,
             aggregation=aggregation)
 
-  if _FromGlobal('no_identity_on_vars'):
-    with tf.device(var.device):
-      return var, var
-  else:
-    # This tf.identity colocated with var.
-    with tf.device(var.device):
-      return tf.identity(var), var
+  return var
 
 
 _global_variable_scope = None
@@ -1983,6 +2106,9 @@ def OverrideVarsFromCheckpoints(session, all_vars, ckpts_loading_rules):
       in the model which should not be overridden, even if they match those in
       the loading rules.
 
+  Returns:
+    A list of overwritten variables.
+
   Raises:
     ValueError: if colliding vars exist or loading rules is not a list.
   """
@@ -1990,6 +2116,7 @@ def OverrideVarsFromCheckpoints(session, all_vars, ckpts_loading_rules):
     tf.logging.info('Overriding vars from multiple checkpoints.')
 
   var_refs_overridden = set()
+  var_names_overridden = set()
   for ckpt_path, loading_rules in ckpts_loading_rules.items():
     tf.logging.info('Overriding vars from checkpoint: %s', ckpt_path)
 
@@ -2006,6 +2133,10 @@ def OverrideVarsFromCheckpoints(session, all_vars, ckpts_loading_rules):
         var[1].experimental_ref()
         for var in _GetVarsToLoad(all_vars, loading_rules[0], loading_rules[1])
     ]
+    var_names_to_override = [
+        var[1].name
+        for var in _GetVarsToLoad(all_vars, loading_rules[0], loading_rules[1])
+    ]
 
     overlap_refs = set.intersection(var_refs_overridden, var_refs_to_override)
     if overlap_refs:
@@ -2014,7 +2145,9 @@ def OverrideVarsFromCheckpoints(session, all_vars, ckpts_loading_rules):
     OverrideVarsFromCheckpoint(session, all_vars, ckpt_path, loading_rules[0],
                                loading_rules[1])
     var_refs_overridden.update(var_refs_to_override)
+    var_names_overridden.update(var_names_to_override)
   tf.logging.info('Model variables overridden: %s', var_refs_overridden)
+  return var_names_overridden
 
 
 def ComputeGradientsSimple(loss, all_vars, grad_aggregation_method,
@@ -2054,7 +2187,8 @@ def _ComputeGradientsTpu(loss,
                          colocate_gradients_with_ops,
                          gate_gradients,
                          skip_zero_gradients=None,
-                         use_bf16_gradients_ar=False):
+                         use_bf16_gradients_ar=False,
+                         defer_crs_to_apply_grad=False):
   """Computes gradients for local loss across whole TPU cluster.
 
   This implementation specializes for the case where weight params maybe used
@@ -2075,6 +2209,11 @@ def _ComputeGradientsTpu(loss,
     skip_zero_gradients: whether to skip zero gradients during aggregation.
     use_bf16_gradients_ar: Whether to use bfloat16 dtype for gradients
       all-reduce.
+    defer_crs_to_apply_grad: Whether to defer gradient cross replica sum to
+      apply_gradient. This helps reducing the number of gradient all-reduces
+      when doing gradient accumulation, which does gradient cross replica sum
+      only every k steps in a tf.cond. Currently this works only when
+      skip_zero_gradients is None.
 
   Returns:
     Gradients to be passed back.
@@ -2113,7 +2252,10 @@ def _ComputeGradientsTpu(loss,
     with tf.ops.colocate_with(g):
       if skip_zero_gradients is None:
         # loss is already scaled by 1/shards.
-        normalized_g = tf.tpu.cross_replica_sum(g)
+        if defer_crs_to_apply_grad:
+          normalized_g = tf.convert_to_tensor(g)
+        else:
+          normalized_g = tf.tpu.cross_replica_sum(g)
       else:
         # Compute the cross-replica mean of 'g', skipping zero gradients.
 
@@ -2159,6 +2301,14 @@ class VarGrad:
     return 'VarGrad(%r, %r)' % (self._var_grad.var, self._var_grad.grad)
 
 
+def SkipNoneGradients(var_grads):
+  """Removes pairs whose grad is None."""
+  for key, (_, g) in var_grads.FlattenItems():
+    if g is None:
+      tf.logging.info('ComputeGradients drops %s', key)
+  return var_grads.Filter(lambda var_grad: var_grad.grad is not None)
+
+
 def ComputeGradients(
     loss,
     vmap,
@@ -2167,7 +2317,9 @@ def ComputeGradients(
     gate_gradients=False,
     compute_gradients_fn=None,
     skip_zero_gradients=None,
-    use_bf16_gradients_ar=False):
+    use_bf16_gradients_ar=False,
+    skip_none_gradients=True,
+    defer_crs_to_apply_grad=False):
   """Computes gradients of variables in vmap w.r.t loss.
 
   Args:
@@ -2196,6 +2348,9 @@ def ComputeGradients(
           abs(grad) < 1e-8.
     use_bf16_gradients_ar: Whether to use bfloat16 dtype for gradients
       all-reduce. This applies to TPU only.
+    skip_none_gradients: Whether to skip gradients that are None.
+    defer_crs_to_apply_grad: Whether to defer gradient cross replica sum to
+      apply_gradient. This applies to TPU only.
 
   Returns:
     var_grad - a `.NestedMap` of VarGrad. You can view
@@ -2239,7 +2394,8 @@ def ComputeGradients(
       take_grad = functools.partial(
           _ComputeGradientsTpu,
           skip_zero_gradients=skip_zero_gradients,
-          use_bf16_gradients_ar=use_bf16_gradients_ar)
+          use_bf16_gradients_ar=use_bf16_gradients_ar,
+          defer_crs_to_apply_grad=defer_crs_to_apply_grad)
     else:
       take_grad = ComputeGradientsSimple
 
@@ -2270,11 +2426,10 @@ def ComputeGradients(
 
     var_grads = var_grads.Filter(CheckGrad)
 
-  # Removes pairs whose grad is None.
-  for key, (_, g) in var_grads.FlattenItems():
-    if g is None:
-      tf.logging.info('ComputeGradients drops %s', key)
-  return var_grads.Filter(lambda var_grad: var_grad.grad is not None)
+  if skip_none_gradients:
+    var_grads = SkipNoneGradients(var_grads)
+
+  return var_grads
 
 
 def MaskGradients(var_grad, grad_mask):
@@ -2584,29 +2739,6 @@ def ConcatRecursively(splits, axis=-1):
     return results
   else:
     raise TypeError('Unexpected type for ConcatRecursively: %s' % type(splits))
-
-
-def AddToPruningCollections(weight,
-                            mask,
-                            threshold,
-                            gradient=None,
-                            old_weight=None,
-                            old_old_weight=None):
-  """Add mask, threshold, and weight vars to their respective collections."""
-  if mask not in tf.get_collection(pruning.MASK_COLLECTION):
-    tf.add_to_collection(pruning.WEIGHT_COLLECTION, weight)
-    tf.add_to_collection(pruning.MASK_COLLECTION, mask)
-    tf.add_to_collection(pruning.THRESHOLD_COLLECTION, threshold)
-
-    # Add gradient, old_weight, and old_old_weight to collections approximating
-    # gradient and hessian, where old_weight is the weight tensor one step
-    # before and old_old_weight is the weight tensor two steps before.
-    if gradient is not None:
-      assert old_weight is not None
-      assert old_old_weight is not None
-      tf.add_to_collection(pruning.WEIGHT_GRADIENT_COLLECTION, gradient)
-      tf.add_to_collection(pruning.OLD_WEIGHT_COLLECTION, old_weight)
-      tf.add_to_collection(pruning.OLD_OLD_WEIGHT_COLLECTION, old_old_weight)
 
 
 def WeightedAvg(values, weights, sum_reduction_fn=tf.reduce_sum, name=''):
@@ -3441,6 +3573,28 @@ def ConcatenatePaddedSequences(input0, input1, padding0, padding1, seq_dim=1):
   return concat_inputs, concat_paddings
 
 
+def ShiftLeft(tensor, shift_size, pad_val=0):
+  """Shifts the values in a tensor to the left along the time dimension (dim 1).
+
+  The first shift_size values are dropped, and the tensor is padded on the
+  right with pad_val.
+
+  Args:
+    tensor: the input tensor to modify shaped [batch, time, ...].
+    shift_size: the number of frames >= 0 to shift.
+    pad_val: the value to pad on the right of the tensor.
+
+  Returns:
+    A left shifted tensor.
+  """
+  with tf.control_dependencies([
+      assert_greater_equal(tensor.shape.rank, 2),
+      assert_greater_equal(shift_size, 0)
+  ]):
+    time = GetShape(tensor)[1]
+    return PadSequenceDimension(tensor[:, shift_size:], time, pad_val)
+
+
 def Retry(*args, **kwargs):
   return retry.Retry(*args, **kwargs)
 
@@ -3703,21 +3857,21 @@ def RematerializeFn(fn, *xs):
   initial_step_seed = GetStepSeed()
   final_step_seed = GenerateSeedFromName(tf.no_op(name='new_step_seed').name)
 
-  def Backward(op, *dy):
+  def Backward(fwd_xs, fwd_ys, d_fwd_ys):
     """The backward function that rematerializes forward outputs."""
+    del fwd_ys
     always_true = tf.random.uniform([]) < 2.0
     # Alternatively, can do this:
     # tf.where(tf.math.is_nan(x),
     #          tf.constant(float('nan'), dtype=x.dtype) * tf.ones_like(x),
     #          x)
-    # Skip op.inputs[0] which is initial_step_seed.
-    bak_xs = [tf.where(always_true, x, tf.zeros_like(x)) for x in op.inputs[1:]]
+    bak_xs = [tf.where(always_true, x, tf.zeros_like(x)) for x in fwd_xs.xs]
     for dst, src in zip(bak_xs, xs):
       dst.set_shape(src.shape)
     ResetStepSeed(initial_step_seed)
     ys = fn(*bak_xs)
     ResetStepSeed(final_step_seed)
-    dxs = tf.gradients(ys, bak_xs, grad_ys=dy)
+    dxs = tf.gradients(ys, bak_xs, grad_ys=d_fwd_ys)
     dxs_final = []
     for dx, x in zip(dxs, bak_xs):
       if dx is None:
@@ -3725,19 +3879,18 @@ def RematerializeFn(fn, *xs):
       else:
         dxs_final.append(dx)
     assert len(dxs_final) == len(bak_xs)
-    return (tf.zeros_like(initial_step_seed),) + tuple(dxs_final)
+    return NestedMap(
+        initial_step_seed=tf.zeros_like(initial_step_seed), xs=dxs_final)
 
-  xs_dtypes = [x.dtype for x in xs]
   ys_shapes = []
 
   # TODO(huangyp, yonghui): Check Forward doesn't use any stateful random ops.
-  @tf.Defun(initial_step_seed.dtype, *xs_dtypes, python_grad_func=Backward)
-  def Forward(initial_step_seed, *fwd_xs):
+  def Forward(fwd_xs):
     """Forward function plus sanity checks."""
-    for dst, src in zip(fwd_xs, xs):
+    for dst, src in zip(fwd_xs.xs, xs):
       dst.set_shape(src.shape)
-    ResetStepSeed(initial_step_seed)
-    ys = fn(*fwd_xs)
+    ResetStepSeed(fwd_xs.initial_step_seed)
+    ys = fn(*fwd_xs.xs)
     # Some sanity check.
     assert not GetExtraInputs()
     assert not GetExtraArgs()
@@ -3751,7 +3904,10 @@ def RematerializeFn(fn, *xs):
       ys_shapes.append(ys.shape)
     return ys
 
-  ys = Forward(initial_step_seed, *xs)
+  ys = CallDefun(
+      Forward,
+      NestedMap(initial_step_seed=initial_step_seed, xs=xs),
+      bak=Backward)
   if isinstance(ys, tuple):
     for y, s in zip(ys, ys_shapes):
       y.set_shape(s)
@@ -3790,7 +3946,7 @@ def StatefulRandomOpsInDefun(func, graph=None):
   Otherwise, these ops produce inconsistent values between FProp and BProp.
 
   Args:
-    func: a _DefinedFunction to check.
+    func: a _DefinedFunction or ConcreteFunction to check.
     graph: a Graph. Set None to use the default graph.
 
   Returns:
@@ -3799,10 +3955,6 @@ def StatefulRandomOpsInDefun(func, graph=None):
   Raises:
     InvalidArgumentError: if the input func/graph is invalid.
   """
-  if not isinstance(func, function._DefinedFunction):  # pylint: disable=protected-access
-    raise tf.errors.InvalidArgumentError(None, None,
-                                         'func is not a _DefinedFunction.')
-
   if graph is None:
     graph = tf.get_default_graph()
   func.add_to_graph(graph)
@@ -3811,15 +3963,18 @@ def StatefulRandomOpsInDefun(func, graph=None):
   # A dict from function name to FunctionDef.
   func_defs = {x.signature.name: x for x in graph_def.library.function}
 
-  if func.definition.signature.name not in func_defs:
-    raise tf.errors.InvalidArgumentError(
-        None, None,
-        'Defun {} is not in the graph .'.format(func.definition.signature.name))
+  if isinstance(func, function._DefinedFunction):  # pylint: disable=protected-access
+    if func.definition.signature.name not in func_defs:
+      raise tf.errors.InvalidArgumentError(
+          None, None, 'Defun {} is not in the graph .'.format(
+              func.definition.signature.name))
+    nodes = py_collections.deque(func.definition.node_def)
+  else:
+    nodes = py_collections.deque(func.function_def.node_def)
 
   stateful_ops = []
 
   # Recursively search for stateful random op.
-  nodes = py_collections.deque(func.definition.node_def)
   while nodes:
     node = nodes.pop()
     assert isinstance(node, node_def_pb2.NodeDef), node
@@ -3842,7 +3997,9 @@ def StatefulRandomOpsInDefun(func, graph=None):
     elif node.op == 'If':
       _AddDefunNodes(node.attr['then_branch'].func.name)
       _AddDefunNodes(node.attr['else_branch'].func.name)
-    else:
+    elif node.op == 'StatefulPartitionedCall':
+      _AddDefunNodes(node.attr['f'].func.name)
+    elif node.op != 'PartitionedCall':
       # For other op, check whether itself is a Defun op.
       _AddDefunNodes(node.op)
 
@@ -4141,12 +4298,12 @@ def _AssertInputsMatch(op, args, implicit_captures):
     raise ValueError(('Too many inputs. The most likely cause is that fwd '
                       'captures additional tensors: extra inputs %r vs %r '
                       'captures=%r') % (list(op.inputs), list(expected_inputs),
-                                        list(implicit_captures.Flatten())))
+                                        list(Flatten(implicit_captures))))
   if len(op.inputs) < expected_num_inputs:
     raise ValueError(('Mismatched inputs to fwd: Found %d vs expected %d: %r'
                       '. Implicit captures(%d) = %r') %
                      (len(op.inputs), expected_num_inputs, list(op.inputs),
-                      len(implicit_captures.Flatten()), implicit_captures))
+                      len(Flatten(implicit_captures)), implicit_captures))
 
 
 def _TensorSpecs(nmap):
@@ -4154,23 +4311,22 @@ def _TensorSpecs(nmap):
   return Transform(lambda t: tf.TensorSpec(t.shape, t.dtype), nmap)
 
 
-def _GetConcreteFunction(func, inputs):
-  """Returns a ConcreteFunction with specific input signature."""
-  return func.get_concrete_function(*Flatten(_TensorSpecs(inputs)))
-
-
-def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None, device=None):
+def _DefineDefun(fwd,
+                 fwd_sig,
+                 bak=None,
+                 bak_as_function=False,
+                 device=None):
   """Wraps fwd in a defun with custom gradient bak.
 
   Args:
     fwd: A callable xs: Nested Structure -> ys: Nested Structure.
     fwd_sig: A Nested Structure of tf.Tensor representing the input signature of
       fwd.
-    bak: A callable xs, ys, dys: Nested Structure -> dxs: Nested Structure. The
-      custom backprop function for fwd. If implicit_captures is not None, bak
-      must return its gradients in a Nested Structure as the last part of dxs.
-    implicit_captures: A Nested Structure of tf.Tensor. Implicit inputs of fwd
-      that are not listed in fwd_sig.
+    bak: A callable xs, ys, dys: Nested Structure -> dxs[, dcapture]: Nested
+      Structure. The custom backprop function for fwd. bak needs to return
+      dcapture if fwd uses any implicitly captured tensors, whose gradients are
+      dcapture.
+    bak_as_function: Whether to create a TF graph function for bak.
     device: the device on which to run fwd and bak.
 
   Returns:
@@ -4180,7 +4336,7 @@ def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None, device=None):
 
   # fwd signature (tf.Tensor dtypes).
   get_dtype = lambda x: x.dtype
-  arg_dtypes = Transform(get_dtype, fwd_sig)
+  arg_dtypes = Flatten(Transform(get_dtype, fwd_sig))
 
   get_shape = lambda x: x.shape
   arg_shapes = Flatten(Transform(get_shape, fwd_sig))
@@ -4188,56 +4344,266 @@ def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None, device=None):
   compiled = use_xla()
   noinline = not compiled
 
-  # Only used to hold the output dtypes of fwd in sigs.rets, which will be set
-  # in Forward.
+  # Used to hold:
+  # - the output dtypes/shapes of fwd, which will be set in Forward.
+  # - the real Backward function used by Grad, which will be defined later.
   sigs = NestedMap()
 
   python_grad_func = None
+  implicit_captures = NestedMap()  # Will be set after Forward is defined.
   if bak:
-    if implicit_captures is None:
-      implicit_captures = NestedMap()
 
-    def Backward(op, *args):
+    def Grad(op, *args):
       """Gradient function for the forward function.
 
       Args:
         op: The forward operation.
-        *args: Args to the backward operation (not including implicit captures).
+        *args: Gradients wrt op.outputs.
 
       Returns:
         Tuple of derivatives.
       """
       _AssertInputsMatch(op, fwd_sig, implicit_captures)
-      xs, _ = Pack([arg_dtypes, implicit_captures], op.inputs)
-      # Note: sigs.rets will be set during the Forward call.
-      ys = Pack(sigs.rets, op.outputs)
-      dys = Pack(sigs.rets, args)
-
       # Ensure dys contains no None.
-      dys = ConvertNoneGradientToZeros(ys, dys)
+      args = ConvertNoneGradientToZeros(list(op.outputs), list(args))
+      xs = op.inputs[:len(arg_dtypes)]  # The rest are captures.
+      return sigs.backward(*Flatten([xs, op.outputs, args]))
 
+    python_grad_func = Grad
+
+  def _SetShape(dst_list, shape_list):
+    for dst, shape in zip(dst_list, shape_list):
+      if isinstance(dst, tf.Tensor):
+        dst.set_shape(shape)
+
+  @tf.Defun(*arg_dtypes, python_grad_func=python_grad_func, noinline=noinline)
+  def Forward(*args):
+    """The forward function."""
+    _SetShape(args, arg_shapes)
+    with RemoveAssertContext(remove=noinline), tf.device(device):
+      rets = fwd(Pack(fwd_sig, args))
+    sigs.ret_dtypes = Transform(get_dtype, rets)
+    sigs.ret_shapes = Transform(get_shape, rets)
+    return Flatten(rets)
+
+  # Invokes fwd() to get sigs.ret_dtypes and sigs.ret_shapes.
+  Forward.add_to_graph(tf.get_default_graph())
+  implicit_captures.captured = Forward.captured_inputs
+
+  if bak:
+
+    def Backward(*args):
+      """The backward function."""
+      xs_len = len(arg_dtypes)
+      ys_len = len(Flatten(sigs.ret_dtypes))
+      xs = args[:xs_len]
+      ys = args[xs_len:(xs_len + ys_len)]
+      dys = args[xs_len + ys_len:]
+      assert len(dys) == ys_len
+
+      _SetShape(xs, arg_shapes)
+      _SetShape(ys, Flatten(sigs.ret_shapes))
+      _SetShape(dys, Flatten(sigs.ret_shapes))
+
+      xs = Pack(fwd_sig, xs)
+      ys = Pack(sigs.ret_dtypes, ys)
+      dys = Pack(sigs.ret_dtypes, dys)
       with RemoveAssertContext(remove=noinline), tf.device(device):
         dxs = bak(xs, ys, dys)
       return Flatten(dxs)
 
-    python_grad_func = Backward
+    if bak_as_function:
+      sigs.backward = tf.Defun(
+          *Flatten([arg_dtypes, sigs.ret_dtypes, sigs.ret_dtypes]),
+          noinline=noinline)(
+              Backward)
 
-  @tf.Defun(
-      *Flatten(arg_dtypes),
-      python_grad_func=python_grad_func,
-      noinline=noinline)
-  def Forward(*args):
-    """The forward function."""
-    for arg, shape in zip(args, arg_shapes):
-      arg.set_shape(shape)
-    with RemoveAssertContext(remove=noinline), tf.device(device):
-      rets = fwd(Pack(arg_dtypes, args))
-    sigs.rets = Transform(get_dtype, rets)
-    return Flatten(rets)
+      sigs.backward.add_to_graph(tf.get_default_graph())
+    else:
+      sigs.backward = Backward
 
   def Call(args):
     """Wrapper of fwd."""
     flat_rets = Forward(*Flatten(args))
+    if not isinstance(flat_rets, (tuple, list)):
+      flat_rets = [flat_rets]
+    _SetShape(flat_rets, Flatten(sigs.ret_shapes))
+    return Pack(sigs.ret_dtypes, flat_rets)
+
+  return Call
+
+
+# Global variable to control rendezvous sharing in tf.function.
+# If False (default) rendezvous sharing is disabled in tf.function, that is, the
+# function body use a separate rendezvous and can't communicate with parent
+# graph via send/recv.
+# With _GetSharedRendezvous() == True, the function body share the same
+# rendezvous with the parent graph and can talk to it using send/recv. This is
+# useful for layers like StackedRecurrent.
+_SHARED_RENDEZVOUS = ThreadLocalStack()
+
+
+@contextlib.contextmanager
+def _SharedRendezvousScope(shared_rendezvous=True):
+  _SHARED_RENDEZVOUS.stack.append(shared_rendezvous)
+  try:
+    yield
+  finally:
+    _SHARED_RENDEZVOUS.stack.pop()
+
+
+def _GetSharedRendezvous():
+  """Get the current rendezvous sharing setting."""
+  return _SHARED_RENDEZVOUS.stack[-1] if _SHARED_RENDEZVOUS.stack else False
+
+
+def _ApplySharedRendezvous(func):
+  """Apply the rendezvous sharing setting on the given tf.function func."""
+  # pylint: disable=protected-access
+  func._shared_rendezvous = _GetSharedRendezvous()
+  # pylint: enable=protected-access
+
+
+def _WrapFunction(func=None, input_signature=None):
+  """Wraps func as a tf.function to be used in If/WhileLoop/CallDefun."""
+  if input_signature is None:
+    input_signature = []
+
+  def Decorated(fn):
+
+    @tf.function(input_signature=input_signature, autograph=False)
+    def Fn(*args):
+      # TODO(b/163904067): mimic Defun' behavior and reset the step seed to
+      # avoid it being used as an implicit capture. This is not a desired
+      # behavir, it should take the step seed from parent graph instead.
+      ResetStepSeed()
+      return fn(*args)
+
+    _ApplySharedRendezvous(Fn)
+
+    # Add the function to the graph so it'll be traced under the current
+    # context. This is necessary if the function body captures any non-tensor
+    # values from the environment, like symbolic maps.
+    cf = Fn.get_concrete_function()
+    cf.add_to_graph()
+    return cf
+
+  # For the `foo = _WrapFunction(foo, ...)` use case.
+  if func is not None:
+    return Decorated(func)
+
+  # For the `@_WrapFunction(...)` use case.
+  return Decorated
+
+
+def _DefineFunction(fwd,
+                    fwd_sig,
+                    bak=None,
+                    bak_as_function=False,
+                    device=None):
+  """Wraps fwd in a defun with custom gradient bak.
+
+  Args:
+    fwd: A callable xs: Nested Structure -> ys: Nested Structure.
+    fwd_sig: A Nested Structure of tf.Tensor representing the input signature of
+      fwd.
+    bak: A callable xs, ys, dys: Nested Structure -> dxs[, dcapture]: Nested
+      Structure. The custom backprop function for fwd. bak needs to return
+      dcapture if fwd uses any implicitly captured tensors, whose gradients are
+      dcapture.
+    bak_as_function: Whether to create a TF graph function for bak.
+    device: the device on which to run fwd and bak.
+
+  Returns:
+    A function that wraps fwd.
+  """
+  assert fwd is not None
+  noinline = not use_xla()
+  fwd_sig = _TensorSpecs(fwd_sig)
+
+  # Only used to hold the output signature of fwd in sigs.rets, which will be
+  # set in Forward.
+  sigs = NestedMap()
+
+  @_WrapFunction(input_signature=Flatten(fwd_sig))
+  def Forward(*args):
+    """The forward function."""
+    with RemoveAssertContext(remove=noinline), tf.device(device):
+      xs = Pack(fwd_sig, args)
+      rets = fwd(xs)
+    sigs.rets = _TensorSpecs(rets)
+    return Flatten(rets)
+
+  shared_rendezvous = _GetSharedRendezvous()
+  implicit_captures = Forward.captured_inputs
+
+  if not bak:
+    forward = Forward
+  else:
+
+    def Backward(*args):
+      xs_len = len(Flatten(fwd_sig))
+      ys_len = len(Flatten(sigs.rets))
+      xs = Pack(fwd_sig, args[:xs_len])
+      ys = Pack(sigs.rets, args[xs_len:(xs_len + ys_len)])
+      dys = Pack(sigs.rets, args[xs_len + ys_len:])
+      with RemoveAssertContext(remove=noinline), tf.device(device):
+        dxs = bak(xs, ys, dys)
+      return Flatten(dxs)
+
+    if bak_as_function:
+      backward_cf = _WrapFunction(
+          Backward, input_signature=Flatten([fwd_sig, sigs.rets, sigs.rets]))
+    else:
+
+      def BackwardWithSharedRendezvous(*args):
+        with _SharedRendezvousScope(shared_rendezvous):
+          return Backward(*args)
+
+      backward_cf = BackwardWithSharedRendezvous
+
+    @tf.custom_gradient
+    def ForwardWithGrad(*args):
+      """Forward function and its custom gradient."""
+      # Note that `args` includes implicit_captures. This is required by
+      # tf.custom_gradient so that when the Grad() outputs include gradients to
+      # implicit captures, they match the inputs to ForwardWithGrad().
+      #
+      # However, Forward doesn't take implicit_captures as input, so we exclude
+      # them here.
+      fwd_args = args[:(len(args) - len(Flatten(implicit_captures)))]
+      op = NestedMap(inputs=args, outputs=Forward(*fwd_args))
+
+      def Grad(*args, **kwargs):
+        """Gradient function for the forward function.
+
+        Args:
+          *args: Gradients wrt op.outputs.
+          **kwargs: Additional arguments from tf.custom_gradient.
+
+        Returns:
+          Tuple of derivatives.
+        """
+        if kwargs:
+          tf.logging.warning(
+              'Ignoring additional arguments used by tf.custom_gradient: %s',
+              str(kwargs))
+
+        _AssertInputsMatch(op, fwd_sig, implicit_captures)
+
+        # Ensure dys contains no None.
+        args = ConvertNoneGradientToZeros(list(op.outputs), list(args))
+
+        xs, _ = Pack([fwd_sig, implicit_captures], op.inputs)
+        return backward_cf(*Flatten([xs, op.outputs, args]))
+
+      return op.outputs, Grad
+
+    forward = lambda *args: ForwardWithGrad(*Flatten([args, implicit_captures]))
+
+  def Call(args):
+    """Wrapper of fwd."""
+    flat_rets = forward(*Flatten(args))
     if not isinstance(flat_rets, (tuple, list)):
       flat_rets = [flat_rets]
     return Pack(sigs.rets, flat_rets)
@@ -4245,22 +4611,31 @@ def _DefineDefun(fwd, fwd_sig, bak=None, implicit_captures=None, device=None):
   return Call
 
 
-def CallDefun(fwd, args, bak=None, implicit_captures=None, device=None):
+def CallDefun(fwd,
+              args,
+              bak=None,
+              bak_as_function=False,
+              device=None):
   """Wraps fwd in a defun with custom gradient bak and calls it with args.
 
   Args:
     fwd: A callable xs: Nested Structure -> ys: Nested Structure.
     args: A Nested Structure of tf.Tensor.
-    bak: A callable xs, ys, dys: Nested Structure -> dxs: Nested Structure. The
-      custom backprop function for fwd.
-    implicit_captures: A Nested Structure of tf.Tensor. Implicit inputs of fwd
-      that are not listed in args.
+    bak: A callable xs, ys, dys: Nested Structure -> dxs[, dcapture]: Nested
+      Structure. The custom backprop function for fwd. bak needs to return
+      dcapture if fwd uses any implicitly captured tensors, whose gradients are
+      dcapture.
+    bak_as_function: Whether to create a TF graph function for bak.
     device: the device on which to run fwd and bak.
 
   Returns:
     A Nested Structure equivalent to what fwd(args) computes.
   """
-  call = _DefineDefun(fwd, args, bak, implicit_captures, device)
+  if _FromGlobal('call_defun_use_tf_function'):
+    fn = _DefineFunction
+  else:
+    fn = _DefineDefun
+  call = fn(fwd, args, bak, bak_as_function, device)
   return call(args)
 
 
@@ -4269,78 +4644,71 @@ def If(cond, inputs, then_branch, else_branch):
 
   Args:
     cond: A scalar `Tensor` that can be converted to boolean.
-    inputs: A NestedMap representing the input tensors of the if/else statement.
-    then_branch: A callable 'inputs' -> NestedMap. The returned NestedMap should
-      be compatible with what 'else_branch' returns.
-    else_branch: A callable 'inputs' -> NestedMap. The returned NestedMap should
-      be compatible with what 'then_branch' returns.
+    inputs: A flattenable representing the input tensors of the if/else
+      statement.
+    then_branch: A callable 'inputs' -> flattenable. The returned value
+      should be compatible with what 'else_branch' returns.
+    else_branch: A callable 'inputs' -> flattenable. The returned value
+      should be compatible with what 'then_branch' returns.
 
   Returns:
-    NestedMap returned by the call to either 'then_branch' or 'else_branch'.
-
-  Raises:
-    TypeError: if
-      - 'inputs' is not a NestedMap, or
-      - 'then_branch' or 'else_branch' doesn't return a NestedMap, or
-      - the outputs of 'then_branch' and 'else_branch' are not compatible.
+    Output returned by the call to either 'then_branch' or 'else_branch'.
   """
-  if not isinstance(inputs, NestedMap):
-    raise TypeError('inputs must be a NestedMap, got %s' % type(inputs))
-
-  then_out = then_branch(inputs)
-  if not isinstance(then_out, NestedMap):
-    raise TypeError('then_branch must return a NestedMap, got %s' %
-                    type(then_out))
-
-  else_out = else_branch(inputs)
-  if not isinstance(else_out, NestedMap):
-    raise TypeError('else_branch must return a NestedMap, got %s' %
-                    type(else_out))
-
-  if not then_out.IsCompatible(else_out):
-    raise TypeError(
-        'Outputs of then_branch and else_branch are not compatible.')
+  ret_dtypes = NestedMap()
+  get_dtype = lambda x: x.dtype
 
   if _FromGlobal('if_use_tf_function'):
 
-    @tf.function(autograph=False)
+    @_WrapFunction(input_signature=Flatten(_TensorSpecs(inputs)))
     def ThenBranch(*args):
-      inp = inputs.Pack(args)
+      inp = Pack(inputs, args)
       out = then_branch(inp)
-      return out.Flatten()
+      ret_dtypes.then_out = Transform(get_dtype, out)
+      return Flatten(out)
 
-    @tf.function(autograph=False)
+    @_WrapFunction(input_signature=Flatten(_TensorSpecs(inputs)))
     def ElseBranch(*args):
-      inp = inputs.Pack(args)
+      inp = Pack(inputs, args)
       out = else_branch(inp)
-      return out.Flatten()
+      ret_dtypes.else_out = Transform(get_dtype, out)
+      return Flatten(out)
 
     ret = tf.If(
         cond=cond,
-        inputs=inputs.Flatten(),
-        then_branch=_GetConcreteFunction(ThenBranch, inputs),
-        else_branch=_GetConcreteFunction(ElseBranch, inputs))
-  else:
-    dtypes = inputs.Transform(lambda x: x.dtype).Flatten()
-
-    @tf.Defun(*dtypes)
-    def ThenBranch(*args):
-      inp = inputs.Pack(args)
-      out = then_branch(inp)
-      return out.Flatten()
-
-    @tf.Defun(*dtypes)
-    def ElseBranch(*args):
-      inp = inputs.Pack(args)
-      out = else_branch(inp)
-      return out.Flatten()
-
-    ret = tf.If(
-        cond=cond,
-        inputs=inputs.Flatten(),
+        inputs=Flatten(inputs),
         then_branch=ThenBranch,
         else_branch=ElseBranch)
-  return then_out.Pack(ret)
+  else:
+    dtypes = Flatten(Transform(lambda x: x.dtype, inputs))
+
+    @tf.Defun(*dtypes)
+    def ThenBranch(*args):
+      for dst, src in zip(args, Flatten(inputs)):
+        dst.set_shape(src.shape)
+      inp = Pack(inputs, args)
+      out = then_branch(inp)
+      ret_dtypes.then_out = Transform(get_dtype, out)
+      return Flatten(out)
+
+    @tf.Defun(*dtypes)
+    def ElseBranch(*args):
+      for dst, src in zip(args, Flatten(inputs)):
+        dst.set_shape(src.shape)
+      inp = Pack(inputs, args)
+      out = else_branch(inp)
+      ret_dtypes.else_out = Transform(get_dtype, out)
+      return Flatten(out)
+
+    ret = tf.If(
+        cond=cond,
+        inputs=Flatten(inputs),
+        then_branch=ThenBranch,
+        else_branch=ElseBranch)
+
+  assert IsCompatible(ret_dtypes.then_out, ret_dtypes.else_out), (
+      'Outputs of then_branch and else_branch are not compatible: {} vs {}'
+      .format(ret_dtypes.then_out, ret_dtypes.else_out))
+  return Pack(ret_dtypes.then_out, ret)
 
 
 def _Itype():
@@ -4364,21 +4732,18 @@ def WhileLoop(cond, body, loop_state):
 
   if _FromGlobal('while_loop_use_tf_function'):
 
-    @tf.function(autograph=False)
+    @_WrapFunction(input_signature=Flatten(_TensorSpecs(state)))
     def LoopCond(*args):
       s = state.Pack(args)
       return cond(s.loop_state)
 
-    @tf.function(autograph=False)
+    @_WrapFunction(input_signature=Flatten(_TensorSpecs(state)))
     def LoopBody(*args):
       s = state.Pack(args)
       s.loop_state = body(s.loop_state)
       return s.Flatten()
 
-    new_state = tf.While(
-        input_=state.Flatten(),
-        cond=_GetConcreteFunction(LoopCond, state),
-        body=_GetConcreteFunction(LoopBody, state))
+    new_state = tf.While(input_=state.Flatten(), cond=LoopCond, body=LoopBody)
   else:
     dtypes = state.Transform(lambda x: x.dtype).Flatten()
 
@@ -4529,8 +4894,15 @@ def GetTpuSummaryTensors():
   }
 
 
-def ComputationShape(split_size):
+def ClearTpuSummaryTensors():
+  tpu_summary_tensors = _get_tpu_summary_tensors()
+  del tpu_summary_tensors[:]
+
+
+def ComputationShape(split_size, topology=None):
   """Decides the computation shape based on the split_size."""
+  if topology:
+    topology_info = tf_topology.Topology(serialized=topology)
   computation_shape = None
   if split_size == 1:
     computation_shape = [1, 1, 1, 1]
@@ -4545,15 +4917,27 @@ def ComputationShape(split_size):
   elif split_size == 32:
     computation_shape = [4, 4, 1, 2]
   elif split_size == 64:
-    computation_shape = [4, 8, 1, 2]
+    if topology and topology_info.mesh_shape[1] == 32:
+      # Fwd within-replica all-reduces is performed along column;
+      # Bwd gradient cross-replica all-reduces is performed along row.
+      # This currently has better performance than the strided patten.
+      computation_shape = [1, 32, 1, 2]
+    else:
+      computation_shape = [4, 8, 1, 2]
   elif split_size == 128:
     computation_shape = [8, 8, 1, 2]
   elif split_size == 256:
     computation_shape = [8, 16, 1, 2]
   elif split_size == 512:
     computation_shape = [16, 16, 1, 2]
+  elif split_size == 1024:
+    computation_shape = [16, 32, 1, 2]
   elif split_size == 2048:
     computation_shape = [32, 32, 1, 2]
+  elif split_size == 4096:
+    computation_shape = [64, 32, 1, 2]
+  elif split_size == 8192:
+    computation_shape = [128, 32, 1, 2]
   else:
     assert False, ('Model parallelism with %d devices is currently not'
                    ' supported.' % split_size)
@@ -4583,3 +4967,16 @@ def GetExtraArgs():
   if isinstance(g, func_graph.FuncGraph):
     return g.internal_captures
   return function.get_extra_args()
+
+
+def ShardedFilePatternToGlob(file_pattern):
+  """Converts a file pattern path@shards to path-?????-of-shards."""
+  if ',' in file_pattern:
+    raise ValueError(
+        'ShardedFilePatternToGlob does not support multiple file patterns.')
+  if '@' not in file_pattern:
+    return file_pattern
+  path, shards = file_pattern.split('@')
+  if shards == '*':
+    return f'{path}-?????-of-*'
+  return f'{path}-?????-of-{int(shards):05}'

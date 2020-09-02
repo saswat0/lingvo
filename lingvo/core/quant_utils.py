@@ -130,19 +130,26 @@ class QuantizableLayer(base_layer.BaseLayer):
     self._qstate = None  # t_name -> Tensor
 
     # Instantiate quantization domains.
-    with tf.variable_scope(p.name + '/q'):
-      self._qdomains = dict()  # Dict of qdname -> QDomain or None
-      for qdname in dir(p.qdomain):
-        qdparams = p.qdomain.Get(qdname)
-        if qdparams is None:
-          continue
-        assert issubclass(qdparams.cls, QDomain), (
-            'Expected quantized domain %s to extend QDomain' % qdname)
-        qdchild_name = 'qdomain_' + qdname
-        self.CreateChild(qdchild_name, qdparams)
-        self._qdomains[qdname] = self.children[qdchild_name]
+    self._qdomains = dict()  # Dict of qdname -> QDomain or None
+    for qdname in dir(p.qdomain):
+      qdparams = p.qdomain.Get(qdname)
+      if qdparams is None:
+        continue
+      assert issubclass(
+          qdparams.cls,
+          QDomain), ('Expected quantized domain %s to extend QDomain' % qdname)
+      qdchild_name = 'qdomain_' + qdname
+      self.CreateChild(qdchild_name, qdparams)
+      self._qdomains[qdname] = self.children[qdchild_name]
     self._AddQuantizationFunctions()
 
+  def _CreateChildrenVariables(self):
+    # Backwards compatibility: child.InstantiateVariables() in custom scope.
+    p = self.params
+    with tf.variable_scope(p.name + '/q'):
+      for qdomain in self._qdomains.values():
+        qdomain.InstantiateVariables()
+    super()._CreateChildrenVariables()
 
   def QRTanh(self, t, domain='actf'):
     """Quantizes the output of a tanh (-1.0, 1.0)."""
@@ -182,7 +189,7 @@ class QuantizableLayer(base_layer.BaseLayer):
     r"""Creates one or more QTensors for later use.
 
     Any tensor that will later be quantized must be created first, preferably
-    in __init__.
+    in _CreateLayerVariables().
 
     Along with a list of tensor names to create, they can be associated with
     a 'domain'. Most layers are simple enough to only have a single quantization
@@ -878,8 +885,7 @@ class SymmetricScheduledClipQDomain(QDomain):
     super().__init__(params)
     p = self.params
 
-    with tf.variable_scope(p.name):
-      self.CreateChild('cc_schedule', p.cc_schedule)
+    self.CreateChild('cc_schedule', p.cc_schedule)
 
   @property
   def bits(self):
@@ -966,13 +972,13 @@ class PassiveAsymQDomain(QDomain):
 
   def __init__(self, params):
     super().__init__(params)
-    p = self.params
 
     self._t_names = set()  # set of known t_name (from CreateTensor)
     self._qvars = py_utils.NestedMap()  # var_name -> tf.Variable
 
+  def _CreateLayerVariables(self):
     # Save a scope for lazily created variables.
-    with tf.variable_scope(p.name + '/q'):
+    with tf.variable_scope('q'):
       self._qvars_scope = tf.get_variable_scope()
 
   def _MaybeFakeQuant(self, inputs, min_v, max_v, num_bits):
@@ -1116,7 +1122,7 @@ class PassiveAsymQDomain(QDomain):
     assert name not in self._qvars, 'QState var already exists: %s' % name
     var_name = self._qvars_scope.name + '/' + name
     with tf.variable_scope(py_utils.GetGlobalVariableScope()):
-      _, v = py_utils.CreateVariable(var_name, params, trainable=False)
+      v = py_utils.CreateVariable(var_name, params, trainable=False)
     self._qvars[name] = v
     return v
 

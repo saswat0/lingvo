@@ -75,18 +75,17 @@ class AsrModel(base_model.BaseTask):
     super().__init__(params)
     p = self.params
 
-    with tf.variable_scope(p.name):
-      # Construct the model.
-      if p.encoder:
-        if not p.encoder.name:
-          p.encoder.name = 'enc'
-        self.CreateChild('encoder', p.encoder)
-      if p.decoder:
-        if not p.decoder.name:
-          p.decoder.name = 'dec'
-        self.CreateChild('decoder', p.decoder)
-      if p.frontend:
-        self.CreateChild('frontend', p.frontend)
+    # Construct the model.
+    if p.encoder:
+      if not p.encoder.name:
+        p.encoder.name = 'enc'
+      self.CreateChild('encoder', p.encoder)
+    if p.decoder:
+      if not p.decoder.name:
+        p.decoder.name = 'dec'
+      self.CreateChild('decoder', p.decoder)
+    if p.frontend:
+      self.CreateChild('frontend', p.frontend)
 
   def _GetDecoderTargets(self, input_batch):
     """Returns targets which will be forwarded to the decoder.
@@ -206,10 +205,12 @@ class AsrModel(base_model.BaseTask):
   def DecodeWithTheta(self, theta, input_batch):
     """Constructs the inference graph."""
     p = self.params
-    with tf.name_scope('fprop'), tf.name_scope(p.name):
-      encoder_outputs = self._FrontendAndEncoderFProp(theta, input_batch.src)
-      decoder_outs = self.decoder.BeamSearchDecodeWithTheta(
-          theta.decoder, encoder_outputs)
+    with tf.name_scope('decode'), tf.name_scope(p.name):
+      with tf.name_scope('encoder'):
+        encoder_outputs = self._FrontendAndEncoderFProp(theta, input_batch.src)
+      with tf.name_scope('beam_search'):
+        decoder_outs = self.decoder.BeamSearchDecodeWithTheta(
+            theta.decoder, encoder_outputs)
 
       if py_utils.use_tpu():
         # Decoder metric computation contains arbitrary execution

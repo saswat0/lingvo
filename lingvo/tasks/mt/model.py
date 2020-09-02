@@ -44,13 +44,19 @@ class MTBaseModel(base_model.BaseTask):
   def __init__(self, params):
     super().__init__(params)
     p = self.params
+    if p.encoder:
+      self.CreateChild('enc', p.encoder)
+    self.CreateChild('dec', p.decoder)
 
+  def _CreateChildrenVariables(self):
+    p = self.params
     with tf.variable_scope(p.name):
       with self._EncoderDevice():
         if p.encoder:
-          self.CreateChild('enc', p.encoder)
+          self.enc.InstantiateVariables()
       with self._DecoderDevice():
-        self.CreateChild('dec', p.decoder)
+        self.dec.InstantiateVariables()
+    super()._CreateChildrenVariables()
 
   def ComputePredictions(self, theta, batch):
     p = self.params
@@ -225,8 +231,7 @@ class InsertionModel(MTBaseModel):
     super().__init__(params)
     p = self.params
 
-    with tf.variable_scope(p.name):
-      self.CreateChild('insertion', p.insertion)
+    self.CreateChild('insertion', p.insertion)
 
   def _SampleCanvasAndTargets(self, x, x_paddings):
     """Sample a canvas and its corresponding targets.

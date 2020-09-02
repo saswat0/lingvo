@@ -137,7 +137,6 @@ class PolynomialSchedule(BaseSchedule):
   def __init__(self, params):
     super().__init__(params)
 
-    @tf.Defun(shape_func=lambda op: [op.inputs[0].shape])
     def Polynomial(x):
       """Polynomial function of x."""
       p = self.params
@@ -164,7 +163,8 @@ class PolynomialSchedule(BaseSchedule):
     self._polynomial = Polynomial
 
   def FProp(self, theta, current_step):
-    return self._polynomial(tf.cast(current_step, dtype=self.params.dtype))
+    return py_utils.CallDefun(self._polynomial,
+                              tf.cast(current_step, dtype=self.params.dtype))
 
 
 class LinearSchedule(PolynomialSchedule):
@@ -209,14 +209,14 @@ class ExponentialSchedule(BaseSchedule):
         LinearSchedule.Params().Set(
             start=(x0, math.log(y0)), limit=(x1, math.log(y1))))
 
-    @tf.Defun()
     def Exp(x):
       return tf.exp(self.linear.Value(x))
 
     self._exp = Exp
 
   def FProp(self, theta, current_step):
-    return self._exp(tf.cast(current_step, dtype=self.params.dtype))
+    return py_utils.CallDefun(self._exp,
+                              tf.cast(current_step, dtype=self.params.dtype))
 
 
 class StepwiseExponentialSchedule(BaseSchedule):
@@ -251,7 +251,6 @@ class CombinedMinimumSchedule(BaseSchedule):
     p = self.params
     self.CreateChildren('schedules', p.schedules)
 
-    @tf.Defun()
     def Combined(x):
       ys = [s.Value(x) for s in self.schedules]
       return tf.reduce_min(tf.stack(ys), axis=0)
@@ -259,7 +258,8 @@ class CombinedMinimumSchedule(BaseSchedule):
     self._combined = Combined
 
   def FProp(self, theta, current_step):
-    return self._combined(current_step)
+    return py_utils.CallDefun(self._combined,
+                              tf.convert_to_tensor(current_step))
 
 
 class TransformerSchedule(BaseSchedule):
@@ -661,15 +661,14 @@ class DevBasedSchedule(BaseSchedule):
           init=py_utils.WeightInit.Constant(1.0),
           collections=['DevBasedSchedule_vars'],
           dtype=tf.float32)
-      _, self._cur_factor, = py_utils.CreateVariable(
+      self._cur_factor = py_utils.CreateVariable(
           'cur_factor', wp, trainable=False)
       wp = py_utils.WeightParams(
           shape=[],
           init=py_utils.WeightInit.Constant(0),
           collections=['DevBasedSchedule_vars'],
           dtype=tf.int64)
-      _, self._ref_step, = py_utils.CreateVariable(
-          'ref_step', wp, trainable=False)
+      self._ref_step = py_utils.CreateVariable('ref_step', wp, trainable=False)
       self._metric_history = early_stop.MetricHistory(p.metric_history)
       self._best_step = ops.best_step(self._metric_history.hist_file,
                                       p.tolerance)

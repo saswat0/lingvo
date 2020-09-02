@@ -61,6 +61,7 @@ py_library(
     srcs = ["batch_major_attention.py"],
     srcs_version = "PY3",
     deps = [
+        ":attention_util",
         ":base_layer",
         ":builder",
         ":conv_layers_builder",
@@ -68,8 +69,8 @@ py_library(
         ":hyperparams",
         ":layers",
         ":layers_with_attention",
+        ":moe_layers",
         ":py_utils",
-        ":relative_atten_util",
         ":symbolic",
         ":tshape",
         "//lingvo:compat",
@@ -156,6 +157,36 @@ py_library(
 )
 
 py_library(
+    name = "conformer_layer",
+    srcs = ["conformer_layer.py"],
+    srcs_version = "PY3",
+    deps = [
+        "//lingvo:compat",
+        "//lingvo/core:base_layer",
+        "//lingvo/core:batch_major_attention",
+        "//lingvo/core:bn_layers",
+        "//lingvo/core:conv_layers_with_time_padding",
+        "//lingvo/core:layers",
+        "//lingvo/core:layers_with_attention",
+    ],
+)
+
+py_test(
+    name = "conformer_layer_test",
+    srcs = ["conformer_layer_test.py"],
+    python_version = "PY3",
+    shard_count = 2,
+    srcs_version = "PY3",
+    deps = [
+        ":conformer_layer",
+        # Implicit absl.testing.flagsaver dependency.
+        # Implicit absl.testing.parameterized dependency.
+        "//lingvo/core:bn_layers",
+        "//lingvo/core:test_utils",
+    ],
+)
+
+py_library(
     name = "target_sequence_sampler",
     srcs = [
         "target_sequence_sampler.py",
@@ -221,10 +252,12 @@ py_test(
 
 py_test(
     name = "batch_major_attention_test",
+    size = "large",
     srcs = ["batch_major_attention_test.py"],
     python_version = "PY3",
     srcs_version = "PY3",
     deps = [
+        ":attention_util",
         ":batch_major_attention",
         ":py_utils",
         ":test_utils",
@@ -340,6 +373,7 @@ py_test(
         ":base_layer",
         ":base_model",
         ":base_model_params",
+        ":distillation_task",
         ":hyperparams",
         ":layers",
         ":learner",
@@ -723,6 +757,7 @@ py_library(
         ":computation_cost",
         ":constants",
         ":conv_layers_with_time_padding",
+        ":pruning_utils",
         ":py_utils",
         ":quant_utils",
         ":recurrent",
@@ -742,6 +777,7 @@ py_library(
     srcs_version = "PY3",
     deps = [
         ":base_layer",
+        ":gradient_combiner",
         ":optimizer",
         ":py_utils",
         ":schedule",
@@ -807,10 +843,10 @@ lingvo_cuda_py_test(
     srcs = ["conv_layers_builder_test.py"],
     python_version = "PY3",
     deps = [
-        ":base_layer",
+        ":bn_layers",
         ":conv_layers_builder",
+        ":conv_layers_with_time_padding",
         ":layers",
-        ":layers_test_lib",
         ":test_utils",
         # Implicit absl.testing.parameterized dependency.
         "//lingvo:compat",
@@ -906,12 +942,13 @@ py_library(
     srcs = ["metrics.py"],
     srcs_version = "PY3",
     deps = [
+        ":hyperparams",
         ":plot",
         ":py_utils",
         ":scorers",
         "//lingvo:compat",
         # Implicit numpy dependency.
-        # Implicit sklearn dependency.
+        # Implicit sklearn dependency.  # buildcleaner: keep
     ],
 )
 
@@ -946,8 +983,10 @@ py_test(
     srcs_version = "PY3",
     deps = [
         ":metrics",
+        ":py_utils",
         ":test_utils",
         "//lingvo:compat",
+        # Implicit numpy dependency.
     ],
 )
 
@@ -1123,6 +1162,16 @@ py_library(
 )
 
 py_library(
+    name = "pruning_utils",
+    srcs = ["pruning_utils.py"],
+    srcs_version = "PY3",
+    deps = [
+        # Implicit model_pruning.pruning dependency.
+        "//lingvo:compat",
+    ],
+)
+
+py_library(
     name = "py_utils",
     srcs = ["py_utils.py"],
     srcs_version = "PY3",
@@ -1131,7 +1180,6 @@ py_library(
         ":retry",
         ":symbolic",
         ":tshape",
-        # Implicit model_pruning.pruning dependency.
         "//lingvo:compat",
         "//lingvo/core/ops",
         # Implicit numpy dependency.
@@ -1159,6 +1207,7 @@ py_test(
         ":test_helper",
         ":test_utils",
         # Implicit absl.testing.flagsaver dependency.
+        # Implicit absl.testing.parameterized dependency.
         "//lingvo:compat",
         "//lingvo:model_registry",
         "//lingvo/tasks/image/params:mnist",
@@ -1202,6 +1251,7 @@ py_library(
     srcs_version = "PY3",
     deps = [
         ":base_layer",
+        ":batch_major_attention",
         ":gpipe",
         ":layers",
         ":layers_with_attention",
@@ -1304,7 +1354,6 @@ py_test(
         # Implicit absl.testing.parameterized dependency.
         "//lingvo:compat",
         # Implicit numpy dependency.
-        # Implicit tensorflow dependency.
     ],
 )
 
@@ -1391,11 +1440,14 @@ lingvo_cuda_py_test(
 )
 
 py_library(
-    name = "relative_atten_util",
-    srcs = ["relative_atten_util.py"],
+    name = "attention_util",
+    srcs = ["attention_util.py"],
     srcs_version = "PY3",
     deps = [
+        ":base_layer",
+        ":layers",
         ":py_utils",
+        ":summary_utils",
         "//lingvo:compat",
     ],
 )
@@ -1410,13 +1462,13 @@ py_library(
 )
 
 py_test(
-    name = "relative_atten_util_test",
-    srcs = ["relative_atten_util_test.py"],
+    name = "attention_util_test",
+    srcs = ["attention_util_test.py"],
     python_version = "PY3",
     srcs_version = "PY3",
     deps = [
+        ":attention_util",
         ":py_utils",
-        ":relative_atten_util",
         ":test_utils",
         # Implicit absl.testing.parameterized dependency.
         "//lingvo:compat",
@@ -1620,6 +1672,15 @@ py_library(
     ],
 )
 
+py_library(
+    name = "tpu_summary",
+    srcs = ["tpu_summary.py"],
+    srcs_version = "PY3",
+    deps = [
+        "//lingvo:compat",
+    ],
+)
+
 py_test(
     name = "wpm_tokenizer_test",
     srcs = ["wpm_tokenizer_test.py"],
@@ -1644,6 +1705,7 @@ py_library(
     deps = [
         ":hyperparams",
         ":layers",
+        ":pruning_utils",
         ":py_utils",
         ":quant_utils",
         ":summary_utils",
@@ -1804,12 +1866,35 @@ py_library(
 )
 
 py_library(
+    name = "moe_layers",
+    srcs = ["moe_layers.py"],
+    deps = [
+        ":base_layer",
+        ":py_utils",
+        ":tpu_summary",
+        "//lingvo:compat",
+    ],
+)
+
+py_library(
     name = "tshape",
     srcs = ["tshape.py"],
     srcs_version = "PY3",
     deps = [
         "//lingvo:compat",
         # Implicit sympy dependency.
+    ],
+)
+
+py_test(
+    name = "tpu_summary_test",
+    srcs = ["tpu_summary_test.py"],
+    python_version = "PY3",
+    srcs_version = "PY3",
+    deps = [
+        ":test_utils",
+        ":tpu_summary",
+        "//lingvo:compat",
     ],
 )
 
@@ -2032,7 +2117,37 @@ py_test(
     srcs_version = "PY3",
     deps = [
         ":egdd",
-        # Implicit numpy dependency.
-        # Implicit tensorflow dependency.
+        ":test_utils",
+        "//lingvo:compat",
+    ],
+)
+
+py_library(
+    name = "distillation_task",
+    srcs = ["distillation_task.py"],
+    srcs_version = "PY3",
+    deps = [
+        ":base_model",
+        ":py_utils",
+        ":schedule",
+        "//lingvo:compat",
+    ],
+)
+
+py_library(
+    name = "gradient_combiner",
+    srcs = ["gradient_combiner.py"],
+    srcs_version = "PY3",
+    deps = [":base_layer"],
+)
+
+py_library(
+    name = "tpu_embedding_layers",
+    srcs = ["tpu_embedding_layers.py"],
+    srcs_version = "PY3",
+    deps = [
+        ":base_layer",
+        ":py_utils",
+        "//lingvo:compat",
     ],
 )

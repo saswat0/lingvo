@@ -113,14 +113,12 @@ class RepeatLayer(base_layer.BaseLayer):
     p = self.params
     assert p.name
     assert p.repeat > 0
-    with tf.variable_scope(p.name):
-      with py_utils.VariableShapePrefixContext(p.repeat):
-        self.CreateChild('body', p.body)
+    self.CreateChild('body', p.body)
 
   def _CreateChildrenVariables(self):
     with tf.variable_scope(self.params.name):
       with py_utils.VariableShapePrefixContext(self.params.repeat):
-        self.body.CreateVariables()
+        self.body.InstantiateVariables()
     super()._CreateChildrenVariables()
 
   def FProp(self, theta, *args):
@@ -227,20 +225,18 @@ class SoftCondLayer(base_layer.BaseLayer):
     assert p.num_experts
     assert p.cond_dim
 
-    with tf.variable_scope(p.name):
-      # Prepends p.num_experts to the tensor shape of every variable created
-      # by p.body.
-      with py_utils.VariableShapePrefixContext(p.num_experts):
-        self.CreateChild('body', p.body)
+    self.CreateChild('body', p.body)
 
   def _CreateChildrenVariables(self):
     with tf.variable_scope(self.params.name):
+      # Prepends p.num_experts to the tensor shape of every variable created
+      # by p.body.
       with py_utils.VariableShapePrefixContext(self.params.num_experts):
-        self.body.CreateVariables()
+        self.body.InstantiateVariables()
     super()._CreateChildrenVariables()
 
-  def _CreateVariables(self):
-    super()._CreateVariables()
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     p = self.params
     # Create Variables for task weight mapping.
     collections = [
@@ -401,20 +397,19 @@ class SequentialLayer(base_layer.BaseLayer):
     super().__init__(params)
     p = self.params
     assert p.name
-    with tf.variable_scope(p.name):
-      if p.repeat <= 1:
-        self._seq = []
-        for sub in p.sub:
-          self.CreateChild(sub.name, sub)
-          self._seq.append((sub.name, self.children[sub.name]))
-      else:
-        # We create 'repeat' number of sub layers. Each sub layer is a
-        # sequential layer specified by 'sub'.  This allows us to name each
-        # repetition with a unique name.
-        children = []
-        for i in range(p.repeat):
-          children.append(p.Copy().Set(name='%03d' % i, repeat=1))
-        self.CreateChildren('rep', children)
+    if p.repeat <= 1:
+      self._seq = []
+      for sub in p.sub:
+        self.CreateChild(sub.name, sub)
+        self._seq.append((sub.name, self.children[sub.name]))
+    else:
+      # We create 'repeat' number of sub layers. Each sub layer is a
+      # sequential layer specified by 'sub'.  This allows us to name each
+      # repetition with a unique name.
+      children = []
+      for i in range(p.repeat):
+        children.append(p.Copy().Set(name='%03d' % i, repeat=1))
+      self.CreateChildren('rep', children)
 
   def FProp(self, theta, *args):
     p = self.params
@@ -442,8 +437,8 @@ class SequentialLayer(base_layer.BaseLayer):
     total = 0
     for _ in range(p.repeat):
       for sub in p.sub:
-        tf.logging.vlog(1, '  seq abs fprop %s %s %d %s', sub.name,
-                             sub.cls, len(args), str(args))
+        tf.logging.vlog(1, '  seq abs fprop %s %s %d %s', sub.name, sub.cls,
+                        len(args), str(args))
         meta = sub.cls.FPropMeta(sub, *args)
         py_utils.CheckShapes(meta.out_shapes)
         total += meta.flops
@@ -469,11 +464,10 @@ class UnarySequentialLayer(base_layer.BaseLayer):
     super().__init__(params)
     p = self.params
     assert p.name
-    with tf.variable_scope(p.name):
-      self._seq = []
-      for sub in p.sub:
-        self.CreateChild(sub.name, sub)
-        self._seq.append((sub.name, self.children[sub.name]))
+    self._seq = []
+    for sub in p.sub:
+      self.CreateChild(sub.name, sub)
+      self._seq.append((sub.name, self.children[sub.name]))
 
   def FProp(self, theta, x):
     tf.logging.vlog(1, 'layer %s', self.params.name)
@@ -822,18 +816,17 @@ class GraphLayer(base_layer.BaseLayer):
     p = self.params
     assert p.name
     assert p.input_endpoints
-    with tf.variable_scope(p.name):
-      self._seq = []
-      for i, (signature, sub) in enumerate(p.sub):
-        assert signature
-        sig = GraphSignature(signature)
-        assert sig.outputs, '{}'.format(signature)
-        name = sub.name
-        if not name:
-          name = '%s_%02d' % (sig.outputs[0], i)
-          sub.name = name
-        self.CreateChild(name, sub)
-        self._seq.append((name, sig, self.children[name]))
+    self._seq = []
+    for i, (signature, sub) in enumerate(p.sub):
+      assert signature
+      sig = GraphSignature(signature)
+      assert sig.outputs, '{}'.format(signature)
+      name = sub.name
+      if not name:
+        name = '%s_%02d' % (sig.outputs[0], i)
+        sub.name = name
+      self.CreateChild(name, sub)
+      self._seq.append((name, sig, self.children[name]))
 
   def FProp(self, theta, *args):
     p = self.params
@@ -858,8 +851,8 @@ class GraphLayer(base_layer.BaseLayer):
         packed = template.Transform(graph_tensors.GetTensor)
         input_args = packed.inputs
         tf.logging.vlog(1, 'signature: %s', p.sub[i][0])
-        tf.logging.vlog(1, 'GraphLayer: call %s %s %d %s', ch.params.name,
-                             ch, len(input_args), str(input_args))
+        tf.logging.vlog(1, 'GraphLayer: call %s %s %d %s', ch.params.name, ch,
+                        len(input_args), str(input_args))
         ch_out = ch.FProp(th, *input_args)
         if len(sig.outputs) == 1:
           ch_out = (ch_out,)
@@ -926,10 +919,9 @@ class ParallelLayer(base_layer.BaseLayer):
     p = self.params
     assert p.name
     self._seq = []
-    with tf.variable_scope(p.name):
-      for sub in p.sub:
-        self.CreateChild(sub.name, sub)
-        self._seq.append((sub.name, self.children[sub.name]))
+    for sub in p.sub:
+      self.CreateChild(sub.name, sub)
+      self._seq.append((sub.name, self.children[sub.name]))
 
   def FProp(self, theta, *args):
     p = self.params
@@ -954,7 +946,7 @@ class ParallelLayer(base_layer.BaseLayer):
     outputs = []
     for sub in p.sub:
       tf.logging.vlog(1, '  par abs fprop %s %s %d %s', sub.name, sub.cls,
-                           len(args), str(args))
+                      len(args), str(args))
       meta = sub.cls.FPropMeta(sub, *args)
       py_utils.CheckShapes(meta.out_shapes)
       meta.VLog(
@@ -1012,8 +1004,8 @@ class LinearLayer(base_layer.BaseLayer):
     p.Define('output_dims', 0, 'Depth of the output.')
     return p
 
-  def _CreateVariables(self):
-    super()._CreateVariables()
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     p = self.params
     self.CreateVariable(
         'w',
@@ -1063,8 +1055,8 @@ class BiasLayer(base_layer.BaseLayer):
     p.Define('dims', 0, 'Depth of the input.')
     return p
 
-  def _CreateVariables(self):
-    super()._CreateVariables()
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     p = self.params
     self.CreateVariable(
         'b',
@@ -1111,8 +1103,7 @@ class BranchLayer(base_layer.BaseLayer):
     super().__init__(params)
     p = self.params
     assert p.name
-    with tf.variable_scope(p.name):
-      self.CreateChild('body', p.body)
+    self.CreateChild('body', p.body)
 
   def FProp(self, theta, *args):
     p = self.params
@@ -1136,8 +1127,7 @@ class BatchParallelLayer(base_layer.BaseLayer):
     super().__init__(params)
     p = self.params
     assert p.name
-    with tf.variable_scope(p.name):
-      self.CreateChild('sub', p.sub)
+    self.CreateChild('sub', p.sub)
 
   def FProp(self, theta, *args):
     """FProp through multiple devices in the split.

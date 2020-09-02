@@ -153,10 +153,10 @@ class NoConstGuaranteeScopeTest(test_utils.TestCase):
           init=py_utils.WeightInit.Constant(0.0),
           dtype=tf.float32,
           collections=['v'])
-      v = py_utils.CreateVariable('v', wp)[1]
+      v = py_utils.CreateVariable('v', wp)
       self.assertEqual(tf.Tensor, type(v))
       with inference_graph_exporter.NoConstGuaranteeScope():
-        v = py_utils.CreateVariable('v', wp, reuse=True)[1]
+        v = py_utils.CreateVariable('v', wp, reuse=True)
         self.assertIsInstance(v, tf.Variable)
 
 
@@ -169,29 +169,34 @@ class LinearModel(base_model.BaseTask):
     p.name = 'linear_model'
     return p
 
-  def __init__(self, params):
-    super().__init__(params)
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     p = self.params
-    with tf.variable_scope(p.name):
-      w = py_utils.WeightParams(
-          shape=[3],
-          init=py_utils.WeightInit.Gaussian(scale=1.0, seed=123456),
-          dtype=p.dtype)
-      b = py_utils.WeightParams(
-          shape=[],
-          init=py_utils.WeightInit.Gaussian(scale=1.0, seed=234567),
-          dtype=p.dtype)
-      self._w, _ = py_utils.CreateVariable('w', w)
-      self._b, _ = py_utils.CreateVariable('b', b)
+    w = py_utils.WeightParams(
+        shape=[3],
+        init=py_utils.WeightInit.Gaussian(scale=1.0, seed=123456),
+        dtype=p.dtype)
+    b = py_utils.WeightParams(
+        shape=[],
+        init=py_utils.WeightInit.Gaussian(scale=1.0, seed=234567),
+        dtype=p.dtype)
+    self.CreateVariable('w', w)
+    self.CreateVariable('b', b)
 
   def Inference(self):
     """Computes y = w^T x + b. Returns y and x, as outputs and inputs."""
-    with tf.variable_scope('inference'):
+    # Add a dummy file def to the collection
+    filename = tf.convert_to_tensor(
+        'dummy.txt', tf.dtypes.string, name='asset_filepath')
+    tf.compat.v1.add_to_collection(tf.compat.v1.GraphKeys.ASSET_FILEPATHS,
+                                   filename)
+
+    with tf.name_scope('inference'):
       x = tf.placeholder(dtype=tf.float32, name='input')
       r = tf.random.stateless_uniform([3],
                                       seed=py_utils.GenerateStepSeedPair(
                                           self.params, self.theta.global_step))
-      y = tf.reduce_sum((self._w + r) * x) + self._b
+      y = tf.reduce_sum((self.vars.w + r) * x) + self.vars.b
       return {'default': ({'output': y}, {'input': x})}
 
 
@@ -200,11 +205,11 @@ class LinearModelTpu(LinearModel):
 
   def Inference(self):
     """Computes y = w^T x + b. Returns y and x, as outputs and inputs."""
-    with tf.variable_scope('inference'):
+    with tf.name_scope('inference'):
       x = tf.placeholder(dtype=tf.bfloat16, name='input')
 
       def InferenceFn(x):
-        return tf.reduce_sum(self._w * x) + self._b
+        return tf.reduce_sum(self.vars.w * x) + self.vars.b
 
       y = tf.tpu.rewrite(InferenceFn, [x])
       return {'tpu': ({'output': y[0]}, {'input': x})}
@@ -267,6 +272,7 @@ class InferenceGraphExporterLinearModelTest(test_utils.TestCase):
     inference_graph = inference_graph_exporter.InferenceGraphExporter.Export(
         params, subgraph_filter=['default'])
     self.assertIn('default', inference_graph.subgraphs)
+    self.assertEqual(1, len(inference_graph.asset_file_def))
 
   def testExportFreezeDefault(self):
     """Test exporting frozen graph."""

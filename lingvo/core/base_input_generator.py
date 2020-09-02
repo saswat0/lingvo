@@ -59,6 +59,38 @@ class BaseInputGenerator(base_layer.BaseLayer):
   """The abstract base input generator."""
 
   @classmethod
+  def DefineInfeedParams(cls, p):
+    # TPU related infeed tuning.
+    # Supported use cases:
+    #
+    # Data parallelism (num_partitions=None)
+    #  - single host (use_per_host_infeed=False, tpu_infeed_parallelism=1))
+    #  - multi host (use_per_host_infeed=False, tpu_infeed_parallelism>1)
+    #  - per host (use_per_host_infeed=True)
+    # Model parallelism (num_partitions>1 where)
+    #  - non-partitioned infeed (use_partitioned_infeed_queue=False):
+    #    - Only first partition gets infeed (e.g. manual partition)
+    #      - single host (use_per_host_infeed=False)
+    #      - per host (use_per_host_infeed=True)
+    #    - All partitions gets data parallel infeed (e.g. MoE)
+    #      - single host not supported
+    #      - per host (use_per_host_infeed=True, use_per_core_infeed=True)
+    #        num_partitions should be set to number of partitions per replica
+    #  - partitioned infeed (use_partitioned_infeed_queue=True)
+    #    - single host (use_per_host_infeed=False)
+    #    - per host (use_per_host_infeed=True)
+    #        num_partitions should be set to number of partitions per replica
+    #        and all partitions should exist on a single host
+    p.Define('use_per_host_infeed', False,
+             'Whether run infeed op on each host.')
+    p.Define('use_per_core_infeed', False,
+             'Whether to shard the infeed per TPU core instead of per replica')
+    p.Define('tpu_infeed_parallelism', 1,
+             'Uses these many python threads to drive infeed concurrently.')
+    p.Define('use_partitioned_infeed_queue', False, 'Use partitioned infeed')
+    p.Define('num_partitions', None, 'Num partitions')
+
+  @classmethod
   def Params(cls):
     """Defaults params for input generators."""
     p = super().Params()
@@ -72,14 +104,9 @@ class BaseInputGenerator(base_layer.BaseLayer):
         'For test/eval dataset, if we want the test/evel job evaluate '
         'the whole dataset, this param must be set precisely. Otherwise, '
         'this param is optional.')
-
-    # TPU related infeed tuning.
-    p.Define('use_per_host_infeed', False,
-             'Whether run infeed op on each host.')
-    p.Define('tpu_infeed_parallelism', 1,
-             'Uses these many python threads to drive infeed concurrently.')
-    p.Define('use_partitioned_infeed_queue', False, 'Use partitioned infeed')
-    p.Define('num_partitions', None, 'Num partitions')
+    p.Define('resettable', False,
+             'If True, the input generator must implement Reset().')
+    cls.DefineInfeedParams(p)
 
     p.Define('remote', hyperparams.Params(),
              'Params to configure remote input policy.')
@@ -92,6 +119,7 @@ class BaseInputGenerator(base_layer.BaseLayer):
     pp.Define(
         'max_inflights_per_target', 32, 'The maximum number of '
         'concurrent inflight remote input fetches per remote target.')
+
     return p
 
   def __init__(self, params):
@@ -110,6 +138,9 @@ class BaseInputGenerator(base_layer.BaseLayer):
     self._tpu_infeed_op = None
     # A list of InfeedQueues.
     self._tpu_queues = []
+
+    # Set to true in GetProcessedInputBatch() (and thus _InputBatch())
+    self._in_get_processed_input_batch = False
 
   def CommonInputOpArgs(self):
     """Common input params."""
@@ -170,7 +201,10 @@ class BaseInputGenerator(base_layer.BaseLayer):
     Subclasses generally should not override this function directly. Instead,
     override _InputBatch and maybe _PreprocessInputBatch.
     """
-    return self._PreprocessInputBatch(self._InputBatch())
+    self._in_get_processed_input_batch = True
+    res = self._PreprocessInputBatch(self._InputBatch())
+    self._in_get_processed_input_batch = False
+    return res
 
   @property
   def tpu_number_of_shards(self):
@@ -178,8 +212,9 @@ class BaseInputGenerator(base_layer.BaseLayer):
     cluster = self.cluster
     num_tpu_hosts = cluster.num_tpu_hosts
     num_infeed_hosts = num_tpu_hosts if p.use_per_host_infeed else 1
-    shards = (cluster.total_worker_devices //
-              num_infeed_hosts) // cluster.num_devices_per_split
+    shards = (cluster.total_worker_devices // num_infeed_hosts)
+    if p.use_partitioned_infeed_queue or not p.use_per_core_infeed:
+      shards = shards // cluster.num_devices_per_split
     return shards
 
   def CreateTpuEnqueueOps(self):
@@ -201,16 +236,19 @@ class BaseInputGenerator(base_layer.BaseLayer):
                 num_tpu_hosts, p.use_per_host_infeed))
 
     assert num_tpu_hosts > 0, ('num_tpu_hosts: %d' % num_tpu_hosts)
+    if p.use_per_core_infeed:
+      if (not p.use_per_host_infeed) or p.use_partitioned_infeed_queue:
+        raise ValueError('use_per_core_infeed need to have use_per_host_infeed '
+                         'but not use_partitioned_infeed_queue.')
     if (cluster.num_devices_per_split > num_cores_per_host and
         p.use_per_host_infeed):
-      tf.logging.fatal(
-          'Doesn\'t support per host infeed mode when '
-          'num_devices_per_split({}) > num_cores_per_host({})'.format(
-              cluster.num_devices_per_split, num_cores_per_host))
-    num_infeed_hosts = num_tpu_hosts if p.use_per_host_infeed else 1
+      tf.logging.fatal('Doesn\'t support per host infeed mode when '
+                       'num_devices_per_split({}) > num_cores_per_host({}).'
+                       'Each host must be able to accommodate >= 1 split when '
+                       'using per_host_infeed.'.format(
+                           cluster.num_devices_per_split, num_cores_per_host))
 
-    shards = (cluster.total_worker_devices //
-              num_infeed_hosts) // cluster.num_devices_per_split
+    shards = self.tpu_number_of_shards
     tf.logging.info('shards {}'.format(shards))
 
     input_ops_list = []
@@ -228,8 +266,9 @@ class BaseInputGenerator(base_layer.BaseLayer):
         list(tpu_embedding.feature_to_config_dict.keys())
         if tpu_embedding is not None else [])
     tf.logging.info('tpu_emb_input_keys: %r', tpu_emb_input_keys)
-    tf.logging.info('num_infeed_hosts: %d', num_infeed_hosts)
 
+    num_infeed_hosts = num_tpu_hosts if p.use_per_host_infeed else 1
+    tf.logging.info('num_infeed_hosts: %d', num_infeed_hosts)
     for task_id in range(num_infeed_hosts):
       host_device = '/task:{}/device:CPU:0'.format(task_id)
       with tf.device(host_device):
@@ -274,7 +313,13 @@ class BaseInputGenerator(base_layer.BaseLayer):
               tuple_types=dtypes,
               tuple_shapes=shapes)
         else:
-          q = tpu_feed.InfeedQueue(tuple_types=dtypes, tuple_shapes=shapes)
+          if p.use_per_core_infeed:
+            q = tpu_feed.InfeedQueue(
+                tuple_types=dtypes,
+                tuple_shapes=shapes,
+                number_of_partitions=p.num_partitions)
+          else:
+            q = tpu_feed.InfeedQueue(tuple_types=dtypes, tuple_shapes=shapes)
           assert shards is not None
           q.set_number_of_shards(shards)
 
@@ -285,6 +330,8 @@ class BaseInputGenerator(base_layer.BaseLayer):
         elif p.use_per_host_infeed:
           # TODO(ylc/zhifengc): Add this to a policy module and test it.
           def TPUOrdinalFunction(shard_index_in_host):
+            if p.use_per_core_infeed:
+              return shard_index_in_host
             device_assignment = py_utils.GetTpuDeviceAssignment()
             if device_assignment:
               # We put both enqueue/dequeue ops at core 0 in each replica.
@@ -416,6 +463,17 @@ class BaseInputGenerator(base_layer.BaseLayer):
       split = batch.Pack(split_flatten)
       ret += [split]
     return ret
+
+  def Reset(self, tf_session):
+    """Reset the input-generator.
+
+    Override so that the input_generator reproduces examples as if from a fresh
+    instantiation.
+
+    Args:
+      tf_session: A tensorflow session.
+    """
+    raise NotImplementedError()
 
 
 class BaseInputGeneratorFromFiles(BaseInputGenerator):
@@ -641,6 +699,12 @@ class BaseInputGeneratorFromFiles(BaseInputGenerator):
       ValueError: If file_datasource is not set
     """
     p = self.params
+    if p.use_per_host_infeed and not self._in_get_processed_input_batch:
+      raise ValueError(
+          'This input generator does not support p.use_per_host_infeed. '
+          'Please set it to False, or move the call to self._BuildDataSource() '
+          'from self.__init__() to self._InputBatch() for batches to be '
+          'correctly replicated per host.')
     if not p.file_datasource and p.file_pattern:
       # This is a workaround for subclasses which have defined
       # their own data source-like functionality.

@@ -66,6 +66,11 @@ class BaseTask(base_layer.BaseLayer):
         'Whether or not to use task-specific global steps, which causes each '
         'task to use its own global_step instead of the true global_step. '
         'NOTE: this may be severely broken. Verify carefully!')
+    p.Define(
+        'defer_global_step_update', False,
+        'Whether or not to defer the global step update. This is used when '
+        'doing gradient accumulation, which update the global step only when '
+        'weights are updated. Currently this supports only true global step.')
     p.Define('train', hyperparams.Params(),
              'Params to control how this task should be trained.')
 
@@ -248,7 +253,6 @@ class BaseTask(base_layer.BaseLayer):
     self._post_train_ops = []
     self._eval_metrics = {}
     self._per_example = {}
-    self._trainer_verbose_tensors = {}
 
     # Create the gradient mask,
     self._per_input_gradient_mask = None
@@ -258,7 +262,7 @@ class BaseTask(base_layer.BaseLayer):
           py_utils.GetGlobalVariableScope()):
         var_name = p.name + '_global_step'
         # Create the variable immediately.
-        self._CreateVariable(
+        self._CreateVariableInternal(
             var_name,
             base_layer.CreateVariableMeta(
                 var_params=py_utils.WeightParams(
@@ -310,17 +314,16 @@ class BaseTask(base_layer.BaseLayer):
     if tp:
       self._SetLearnerFromLegacyParams(tp)
       if tp.learner is not None:
-        with tf.variable_scope(p.name):
-          if isinstance(tp.learner, (list, tuple)):
-            self.CreateChildren('learners', tp.learner)
-          else:
-            self.CreateChildren('learners', [tp.learner])
+        if isinstance(tp.learner, (list, tuple)):
+          self.CreateChildren('learners', tp.learner)
+        else:
+          self.CreateChildren('learners', [tp.learner])
     self._UpdateVnConfig()
 
-  def CreateVariables(self):
+  def InstantiateVariables(self):
     with py_utils.GlobalStepContext(
         tf.identity(self._global_step_var, name='global_step_tensor')):
-      super(BaseTask, self).CreateVariables()
+      super().InstantiateVariables()
 
   def _SetLearnerFromLegacyParams(self, tp):
     """Sets tp.learner based on legacy params."""
@@ -447,23 +450,21 @@ class BaseTask(base_layer.BaseLayer):
     with tf.name_scope('fprop'), tf.name_scope(p.name):
       # Always reset step seed at the start of a new global_step.
       py_utils.ResetStepSeed()
-      if py_utils.use_tpu():
-        metrics, per_example = self._FPropTpu(theta, input_batch)
-      else:
-        metrics, per_example = self._FPropSplitInputBatch(theta, input_batch)
+      metrics, per_example = self._FPropSplitInputBatch(theta, input_batch)
       self._FPropResult(metrics, per_example)
     return metrics, per_example
 
   def _FPropTpu(self, theta, input_batch):
-    p = self.params
-    with tf.name_scope('fprop'), tf.name_scope(p.name):
-      with tf.name_scope('tower_0_0'):
-        metrics, per_example = self.FPropTower(theta, input_batch)
-        metrics = py_utils.WeightedAvgOfMetrics([metrics])
+    with tf.name_scope('tower_0_0'):
+      metrics, per_example = self.FPropTower(theta, input_batch)
+      metrics = py_utils.WeightedAvgOfMetrics([metrics])
     return metrics, per_example
 
   def _FPropSplitInputBatch(self, theta, input_batch):
     """Splits the input batch on the input device."""
+    if py_utils.use_tpu():
+      return self._FPropTpu(theta, input_batch)
+
     cluster = self.cluster
     num_splits = cluster.num_splits_per_client
 
@@ -499,7 +500,6 @@ class BaseTask(base_layer.BaseLayer):
                 metrics, per_example = self.FPropTower(theta_local, batch)
           all_metrics.append(metrics)
           all_per_example_tensors.append(per_example)
-
     return py_utils.WeightedAvgOfMetrics(
         all_metrics), py_utils.ConcatPerExampleTensors(all_per_example_tensors)
 
@@ -521,14 +521,18 @@ class BaseTask(base_layer.BaseLayer):
     self._metrics = metrics
     summary_utils.scalar('num_predictions', self._num_predictions)
 
+  def GetInputBatch(self):
+    """Gets an input batch."""
+    if py_utils.use_tpu():
+      return self.input_generator.TpuDequeueBatch()
+    else:
+      return self.input_generator.SplitInputBatch(
+          self.cluster.num_splits_per_client)
+
   def FPropDefaultTheta(self, input_batch=None):
     """Calls `FProp` with this layer's parameters."""
     if input_batch is None:
-      if py_utils.use_tpu():
-        input_batch = self.input_generator.TpuDequeueBatch()
-      else:
-        input_batch = self.input_generator.SplitInputBatch(
-            self.cluster.num_splits_per_client)
+      input_batch = self.GetInputBatch()
     return self.FProp(self.theta, input_batch)
 
   def AdjustGradients(self, vars_gradients):
@@ -545,8 +549,10 @@ class BaseTask(base_layer.BaseLayer):
   def BProp(self):
     self._BPropForVariables(self.vars)
 
-  def _BPropForVariables(self, vmap):
-    """Constructs the backward graph."""
+  def _BPropGenTrainOps(self, vmap, metrics=None, add_summary=True):
+    """Populates the train_ops dictionary in a backwards pass."""
+    metrics = metrics or self._metrics
+
     bprop_variable_filters = self.input_generator.GetBpropVariableFilters()
     # Only compute the mask if the variable filters are not empty.
     if bprop_variable_filters != [''] * len(bprop_variable_filters):
@@ -562,36 +568,41 @@ class BaseTask(base_layer.BaseLayer):
       }
     all_losses = []
     for optimization in self.learners:
-      loss_name = optimization.params.name
-      metric = self._metrics.get(loss_name, None)
-      if metric is None:
-        raise ValueError('Loss %s not found in metrics %s' %
-                         (loss_name, list(self._metrics.keys())))
-      loss = metric[0]
-      all_losses.append(loss)
-      train_ops['train/%s' % loss_name], eval_metrics = optimization.Apply(
-          loss,
-          vmap,
-          gradient_mask=gradient_mask,
-          gradient_adjuster=self.AdjustGradients)
-      for key, (value, weight) in eval_metrics.items():
-        self.AddEvalMetric(key + '/' + loss_name, value, weight)
+      learner_name = optimization.params.name
+      (losses, train_ops['train/%s' % learner_name],
+       eval_metrics) = optimization.Apply(
+           metrics,
+           vmap,
+           gradient_mask=gradient_mask,
+           gradient_adjuster=self.AdjustGradients)
+      all_losses.extend(losses)
+      if add_summary:
+        for key, (value, weight) in eval_metrics.items():
+          self.AddEvalMetric(key + '/' + learner_name, value, weight)
 
     relevant_bn_updates, _ = py_utils.FindRelevantBatchNormUpdates(
         all_losses, tf.get_collection(py_utils.BATCH_NORM_UPDATES))
     train_ops['bn_updates'] = relevant_bn_updates
 
+    var_update_ops = [
+        tf.group(*tf.nest.flatten(train_ops), name='var_update_ops')
+    ]
     # Post training step update.
-    train_ops['post_step'] = self.PostTrainingStepUpdate(self.global_step)
+    with tf.control_dependencies(var_update_ops):
+      post_step_op = self.PostTrainingStepUpdate(self.global_step)
 
-    with tf.control_dependencies(tf.nest.flatten(train_ops)):
+    train_ops = {}
+    with tf.control_dependencies([post_step_op]):
       # Get the op to update the weight masks and thresholds
       mask_update_op = self._GetMaskUpdateOp()
       train_ops['mask_updates'] = mask_update_op
       with tf.control_dependencies([mask_update_op]):
         true_global_step = py_utils.GetOrCreateGlobalStepVar()
         with tf.ops.colocate_with(true_global_step):
-          increment_global_steps = tf.assign_add(true_global_step, 1)
+          if self.params.defer_global_step_update:
+            increment_global_steps = true_global_step
+          else:
+            increment_global_steps = tf.assign_add(true_global_step, 1)
         if self._global_step_var != true_global_step:
           with tf.ops.colocate_with(self._global_step_var):
             increment_global_steps = tf.group(
@@ -611,6 +622,11 @@ class BaseTask(base_layer.BaseLayer):
 
     for op_name, op in train_ops.items():
       assert op is not None, op_name
+    return train_ops
+
+  def _BPropForVariables(self, vmap):
+    """Constructs the backward graph."""
+    train_ops = self._BPropGenTrainOps(vmap)
 
     # TODO(rpang): try to structure _train_op as:
     #   tf.cond(skip_step, <only update skip stats>, <all updates>)
@@ -645,9 +661,9 @@ class BaseTask(base_layer.BaseLayer):
   def ApplyExponentialMovingAverage(self, ema):
     """Wraps `self.train_op` with an op updating exponential moving average."""
     if (self._create_variables_status !=
-        base_layer._CreateVariablesStatus.COMPLETED):  # pylint: disable=protected-access
+        base_layer._CreateLayerVariablesStatus.COMPLETED):  # pylint: disable=protected-access
       raise ValueError(
-          'ApplyExponentialMovingAverage called before CreateVariables!')
+          'ApplyExponentialMovingAverage called before InstantiateVariables!')
     # TODO(rpang): raise an exception if this is called in the eval mode.
     p = self.params
     # We need to apply EMA to trainable and moving average variable of this
@@ -806,26 +822,6 @@ class BaseTask(base_layer.BaseLayer):
       raise ValueError('Metric %s has already been defined.' % name)
     self._per_example[name] = value
 
-  @property
-  def trainer_verbose_tensors(self):
-    """Return the dict of verbose tensors to eval in the training loop."""
-    return self._trainer_verbose_tensors
-
-  def AddTrainerVerboseTensor(self, name, target):
-    """Add a (set of) tensors to be evaluated in the training loop.
-
-    Args:
-      name: A python string. The name of the target(s).
-      target: A Tensor or a list or dict of Tensors.
-
-    Raises:
-      ValueError: if `name` is already defined.
-
-    """
-    if name in self._trainer_verbose_tensors:
-      raise ValueError('Verbose target %s has already been defined.' % name)
-    self._trainer_verbose_tensors[name] = target
-
   def _UpdateVnConfig(self):
     """Update vn config from the various vn flags."""
     p = self.params
@@ -855,157 +851,6 @@ class BaseTask(base_layer.BaseLayer):
         pruning_obj.add_pruning_summaries()
       mask_update_op = pruning_obj.conditional_mask_update_op()
     return mask_update_op
-
-
-class DistillationTask(BaseTask):
-  """A task to distill knowledge from a teacher task to a student task.
-
-  The training parameters (e.g., learning rate) are determined only by
-  `DistillationTask.params.train`. Teacher and student task's training and eval
-  parameters must be set to None.
-  """
-
-  @classmethod
-  def Params(cls):
-    p = super().Params()
-    p.Define('teacher', None, 'The teacher task params.')
-    p.Define('student', None, 'The student task params.')
-    p.Define(
-        'distillation_loss_weight',
-        # Only uses distillation loss by default.
-        schedule.ConstantOne.Params(),
-        'A schedule of distillation loss weight. '
-        'The weight determines the fraction of total loss contributed by '
-        'distillation loss, while the rest loss will be computed against '
-        'the ground truth. '
-        'A weight of 0 means to only use ground-truth and ignore teacher '
-        'predictions, while a weight 1 means to only use teacher '
-        'predictions and ignore ground truth. '
-        'The weight is specified as a schedule to allow it to change '
-        'during training.')
-    p.Define(
-        'teacher_target_type', 'truth', 'The target type for the teacher. '
-        'Choices are: '
-        ' "truth": using the ground-truth target labels '
-        ' "beam": using the 1-best hypothesis from the beam search.')
-    p.Define(
-        'beam_search_temperature', 1.0, 'The temperature to scale the'
-        'log-prob of each beam search hypothesis. This is used in '
-        'training only')
-    p.Define(
-        'train_teacher', False, 'Adds the teacher\'s loss (w.r.t the ground '
-        'truth labels) to the overall ground truth loss. This can be used for '
-        'instance when the teacher is trained in parallel to the student.')
-    return p
-
-  def __init__(self, params):
-    assert issubclass(params.cls, DistillationTask)
-    super().__init__(params)
-
-    p = self.params
-    # While student does not need its own input generator for training, it
-    # needs an input generator for inference graphs.
-    p.student.input = p.input
-    # Teacher also might need an input generator, eg. for waveform_processor.
-    p.teacher.input = p.input
-    with tf.variable_scope(p.name):
-      for child in ('teacher', 'student'):
-        child_p = getattr(p, child)
-        assert issubclass(child_p.cls, BaseTask)
-        assert child_p.train is None
-        assert child_p.eval is None
-        # In theory it's ok for teacher to be a DistillationTask. In practice
-        # it probably won't happen.
-        assert not issubclass(child_p.cls, DistillationTask)
-        child_p.name = child
-        self.CreateChild(child, child_p)
-      self.CreateChild('distillation_loss_weight', p.distillation_loss_weight)
-
-  def ComputePredictions(self, theta, input_batch):
-    p = self.params
-    with tf.name_scope(p.name):
-      if p.teacher_target_type == 'truth':
-        teacher_predictions = self.teacher.ComputePredictions(
-            theta.teacher, input_batch)
-        student_predictions = self.student.ComputePredictions(
-            theta.student, input_batch)
-        return py_utils.NestedMap(
-            teacher=teacher_predictions, student=student_predictions)
-      elif p.teacher_target_type == 'beam':
-        (teacher_predictions, teacher_input_batch,
-         teacher_beam_prob) = self.teacher.ComputeBeamPredictions(
-             theta.teacher, input_batch, p.beam_search_temperature)
-        # We use 'teacher_input_batch' instead of 'input_batch' for 'student'
-        # because the training of student network uses target transcripts for
-        # the "teacher forcing" mode and here the target transcripts should come
-        # from the teacher's beam search.
-        student_predictions = self.student.ComputePredictions(
-            theta.student, teacher_input_batch)
-        return py_utils.NestedMap(
-            teacher=teacher_predictions,
-            student=student_predictions,
-            teacher_beam_prob=teacher_beam_prob)
-      else:
-        raise ValueError('teacher target type not defined properly: %s' %
-                         self.p.teacher_target_type)
-
-  def ComputeLoss(self, theta, predictions, input_batch):
-    p = self.params
-    per_example = {}
-    with tf.name_scope('groundtruth_loss'):
-      student_groundtruth_loss, student_groundtruth_per_example = (
-          self.student.ComputeLoss(theta.student, predictions.student,
-                                   input_batch))
-      groundtruth_loss = student_groundtruth_loss
-      groundtruth_loss['student_groundtruth_loss'] = (
-          student_groundtruth_loss['loss'])
-      per_example.update(student_groundtruth_per_example)
-
-      if p.train_teacher:
-        teacher_groundtruth_loss, _ = self.teacher.ComputeLoss(
-            theta.teacher, predictions.teacher, input_batch)
-        groundtruth_loss['teacher_groundtruth_loss'] = (
-            teacher_groundtruth_loss['loss'])
-        # The new loss is the wighted sum of the teacher and student losses.
-        groundtruth_loss['loss'] = py_utils.WeightedAvg(*zip(
-            teacher_groundtruth_loss['loss'], student_groundtruth_loss['loss']))
-
-    with tf.name_scope('distillation_loss'):
-      distillation_loss, distill_per_example = self.ComputeDistillationLoss(
-          theta, predictions, input_batch)
-      distillation_loss['distillation_loss'] = distillation_loss['loss']
-      per_example.update(distill_per_example)
-
-    distillation_loss_weight = self.distillation_loss_weight.FProp(
-        theta.distillation_loss_weight, self.global_step)
-    metrics = py_utils.CombineMetrics([
-        (groundtruth_loss, 1 - distillation_loss_weight),
-        (distillation_loss, distillation_loss_weight),
-    ])
-    return metrics, per_example
-
-  def ComputeDistillationLoss(self, theta, predictions, input_batch):
-    raise NotImplementedError('Abstract method')
-
-  def BProp(self):
-    p = self.params
-    if p.train_teacher:
-      return super().BProp()
-    else:
-      # Only bprop on student variables.
-      self._BPropForVariables(self.student.vars)
-
-  def Decode(self, input_batch):
-    return self.student.Decode(input_batch)
-
-  def Inference(self):
-    return self.student.Inference()
-
-  def CreateDecoderMetrics(self):
-    return self.student.CreateDecoderMetrics()
-
-  def PostProcessDecodeOut(self, dec_out_dict, dec_metrics_dict):
-    return self.student.PostProcessDecodeOut(dec_out_dict, dec_metrics_dict)
 
 
 class BaseModel(base_layer.BaseLayer):
@@ -1220,9 +1065,9 @@ class SingleTaskModel(SingleTaskBase):
     self.CreateChild('_task', self.params.task)
 
   def _CreateChildrenVariables(self):
-    # Backwards compatibility: manually call child.CreateVariables() outside of
-    # tf.variable_scope(p.name).
-    self._task.CreateVariables()
+    # Backwards compatibility: manually call child.InstantiateVariables()
+    # outside of tf.variable_scope(p.name).
+    self._task.InstantiateVariables()
     super()._CreateChildrenVariables()
 
 
@@ -1238,22 +1083,15 @@ class MultiTaskSubModel(SingleTaskBase):
   def Params(cls):
     p = super().Params()
     p.name = 'multi_task_sub_model'
-    p.Define('model_params', None, 'Params of a model to create.')
     p.Define('task_name', '', 'The name of the task to execute from the '
              'enclosing model.')
     return p
 
-  def __init__(self, params):
+  def __init__(self, params, shared_model=None):
     super().__init__(params)
     p = self.params
-    self.CreateChild('_model', p.model_params)
+    self._model = shared_model
     self._task = self._model.children.Get(p.task_name)
-
-  def _CreateChildrenVariables(self):
-    # Backwards compatibility: manually call child.CreateVariables() outside of
-    # tf.variable_scope(p.name).
-    self._model.CreateVariables()
-    super()._CreateChildrenVariables()
 
 
 class MultiTaskModel(BaseModel):
@@ -1336,11 +1174,7 @@ class MultiTaskModel(BaseModel):
     # or CreateChildren calls.
     with tf.name_scope(p.name):
       for task_name, task_params in sorted_task_params:
-        if p.task_name_var_scope:
-          with tf.variable_scope(task_name):
-            self.CreateChild(task_name, task_params)
-        else:
-          self.CreateChild(task_name, task_params)
+        self.CreateChild(task_name, task_params)
 
       self.CreateChild('task_schedule', p.task_schedule)
 
@@ -1349,10 +1183,10 @@ class MultiTaskModel(BaseModel):
       for task_name, task in zip(self.task_names, self.tasks):
         if self.params.task_name_var_scope:
           with tf.variable_scope(task_name):
-            task.CreateVariables()
+            task.InstantiateVariables()
         else:
-          task.CreateVariables()
-      self.task_schedule.CreateVariables()
+          task.InstantiateVariables()
+      self.task_schedule.InstantiateVariables()
     super()._CreateChildrenVariables()
 
   @property

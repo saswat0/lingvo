@@ -32,14 +32,10 @@ from tensorflow.python.ops import inplace_ops  # pylint:disable=g-direct-tensorf
 # defuns, so we allow them to be disabled. A potentially more robust fix is
 # to save and merge the attention state across the defun boundary as is
 # done in recurrent.py.
-def _ConditionalDefun(cond, *args, **kwargs):
-
-  def Decorator(f):
-    if not cond:
-      return f
-    return tf.Defun(*args, **kwargs)(f)
-
-  return Decorator
+def _ConditionalCallDefun(cond, f, inputs):
+  if not cond:
+    return f(inputs)
+  return py_utils.CallDefun(f, inputs)
 
 
 def _ApplyAttentionDropout(params, x, global_step):
@@ -215,6 +211,9 @@ class BaseAttentionLayer(quant_utils.QuantizableLayer):
     super().__init__(params)
 
     self._source_init_done = False
+
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     self.TrackQTensor('logits', domain='fullyconnected')
 
   def InitForSourcePacked(self,
@@ -468,18 +467,14 @@ class AdditiveAttention(BaseAttentionLayer):
     super().__init__(params)
     p = self.params
 
-    # noinline and compiled cannot be set at the same time
-    @tf.Defun(*([py_utils.FPropDtype(p)] * 7), noinline=not py_utils.use_tpu())
-    def AttenProbs(concated_source_vecs, source_padding, query_vec_reshaped, v,
-                   per_step_source_padding, source_segment_id,
-                   query_segment_id):
+    def AttenProbs(inputs):
       """Generates probs."""
-      source_batch = py_utils.GetShape(source_padding)[1]
-      target_batch = py_utils.GetShape(per_step_source_padding)[0]
+      source_batch = py_utils.GetShape(inputs.source_padding)[1]
+      target_batch = py_utils.GetShape(inputs.per_step_source_padding)[0]
       multiplier = target_batch // source_batch
 
       # Shape of summed is [sl, tb/sb, sb, hidden_dim].
-      summed = tf.tanh(concated_source_vecs + query_vec_reshaped)
+      summed = tf.tanh(inputs.concated_source_vecs + inputs.query_vec_reshaped)
       # logits is of shape [sl * tb/sb * sb, 1]. Computes dot product
       # between v with every rows in 'summed'. Then we reshape the
       # result to be of shape [sl, tb/sb, sb].
@@ -489,21 +484,22 @@ class AdditiveAttention(BaseAttentionLayer):
       #                         tf.reshape(v, [1, 1, 1, hidden_dim]), 3)
       logits = py_utils.Matmul(
           tf.reshape(summed, [-1, p.hidden_dim]),
-          tf.reshape(v, [p.hidden_dim, 1]))
+          tf.reshape(inputs.v, [p.hidden_dim, 1]))
       logits = tf.reshape(logits, tf.shape(summed)[:3])
       # Take out the padding states.
       # _source_padding is of shape [source_length, source_batch].
       # reshaped to [source_length, 1, source_batch].
       # per_step_source_padding is reshaped to the same but with 'multiplier'
       # for the second dim.
-      source_padding = tf.expand_dims(source_padding, 1)
+      source_padding = tf.expand_dims(inputs.source_padding, 1)
       per_step_source_padding = tf.reshape(
-          tf.transpose(per_step_source_padding), [-1, multiplier, source_batch])
+          tf.transpose(inputs.per_step_source_padding),
+          [-1, multiplier, source_batch])
       source_padding += per_step_source_padding
 
       if p.packed_input:
         source_padding = self._UpdatePaddingWithPackedInputMask(
-            source_padding, source_segment_id, query_segment_id)
+            source_padding, inputs.source_segment_id, inputs.query_segment_id)
       # Reshape logits to a matrix of shape [target_batch, source_length] and
       # takes the softmax to compute the probabilities.
       logits = tf.transpose(tf.reshape(logits, [-1, target_batch]))
@@ -552,9 +548,16 @@ class AdditiveAttention(BaseAttentionLayer):
       query_vec_reshaped = tf.reshape(
           query_vec_transformed, [1, multiplier, source_batch, p.hidden_dim])
       # probs is of shape [target_batch, source_length]
-      probs = AttenProbs(concated_source_vecs, source_padding,
-                         query_vec_reshaped, v, per_step_source_padding,
-                         source_segment_id, query_segment_id)
+      probs = py_utils.CallDefun(
+          AttenProbs,
+          py_utils.NestedMap(
+              concated_source_vecs=concated_source_vecs,
+              source_padding=source_padding,
+              query_vec_reshaped=query_vec_reshaped,
+              v=v,
+              per_step_source_padding=per_step_source_padding,
+              source_segment_id=source_segment_id,
+              query_segment_id=query_segment_id))
       probs.set_shape(per_step_source_padding.shape)
 
       # Apply dropout to weights if applicable.
@@ -609,25 +612,23 @@ class AdditiveAttention(BaseAttentionLayer):
       # [b, hidden_dim]
       query_vec = py_utils.Matmul(query_vec, w)
       # [sl, b]
-      @tf.Defun(
-          *([py_utils.FPropDtype(p)] * 7), noinline=not py_utils.use_tpu())
-      def AttenProbs(x, source_padding, y, v, per_step_source_padding,
-                     source_segment_id, query_segment_id):
+      def AttenProbs(inputs):
         """Calculates atten probs with padding."""
         # tf.tanh(x+y) shape [sl, b, hidden_dim]
-        summed = tf.tanh(x + y)
+        summed = tf.tanh(inputs.x + inputs.y)
         # [-1, hidden_dim] * [hidden_dim, 1] = [-1, 1]
         res = py_utils.Matmul(
-            tf.reshape(summed, [-1, p.hidden_dim]), tf.expand_dims(v, 1))
+            tf.reshape(summed, [-1, p.hidden_dim]), tf.expand_dims(inputs.v, 1))
         # Reshape res to [sl, b]
         logits = tf.reshape(res, tf.shape(summed)[:2])
         # Take out the padding states. _source_padding is of shape [sl, b].
-        source_padding += tf.transpose(per_step_source_padding)
+        source_padding = inputs.source_padding + tf.transpose(
+            inputs.per_step_source_padding)
 
         if p.packed_input:
           source_padding = self._UpdatePaddingWithPackedInputMask(
-              tf.expand_dims(source_padding, 1), source_segment_id,
-              query_segment_id)
+              tf.expand_dims(source_padding, 1), inputs.source_segment_id,
+              inputs.query_segment_id)
           source_padding = tf.squeeze(source_padding, 1)
         # [b, sl]
         source_padding = tf.transpose(source_padding)
@@ -636,9 +637,16 @@ class AdditiveAttention(BaseAttentionLayer):
         probs = self._PaddedSoftmax(logits, source_padding)
         return probs
 
-      probs = AttenProbs(concated_source_vecs, source_padding, query_vec, v,
-                         per_step_source_padding, source_segment_id,
-                         query_segment_id)
+      probs = py_utils.CallDefun(
+          AttenProbs,
+          py_utils.NestedMap(
+              x=concated_source_vecs,
+              source_padding=source_padding,
+              y=query_vec,
+              v=v,
+              per_step_source_padding=per_step_source_padding,
+              source_segment_id=source_segment_id,
+              query_segment_id=query_segment_id))
       probs.set_shape(per_step_source_padding.shape)
 
       # contexts[i, :] is a weighted (probs[i, :]) average of
@@ -673,8 +681,8 @@ class AdditiveAttention(BaseAttentionLayer):
 
     self._encode_source = EncodeSource
 
-  def _CreateVariables(self):
-    super()._CreateVariables()
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     p = self.params
     pc = py_utils.WeightParams(
         shape=[p.source_dim, p.hidden_dim],
@@ -828,6 +836,10 @@ class DotProductAttention(BaseAttentionLayer):
     p.Define('source_dim', 0, 'Number of source nodes.')
     p.Define('query_dim', 0, 'Number of query nodes.')
     p.Define('hidden_dim', 0, 'Number of hidden nodes.')
+    p.Define(
+        'use_dim_scale', True, 'Whether or not to use per_dim_scale to scale '
+        'the individual dims when calculating attention probabilities. It can '
+        'increase training stability when set to False.')
     return p
 
   def __init__(self, params):
@@ -838,14 +850,11 @@ class DotProductAttention(BaseAttentionLayer):
     assert p.source_dim == p.query_dim
     assert p.source_dim == p.hidden_dim
 
-    @tf.Defun(*[py_utils.FPropDtype(p)] * 7, noinline=not py_utils.use_tpu())
-    def AttenProbs(per_dim_scale, source_padding, concated_source_vecs,
-                   query_vec, per_step_source_padding, source_segment_id,
-                   query_segment_id):
+    def AttenProbs(inputs):
       """Main attention function.
 
       target_batch = source_batch * n where n is an integer >= 1.
-      In this case query_vec contains:
+      In this case inputs.query_vec contains:
               -------------------------
               | instance    1         |
               | instance    2         |
@@ -867,37 +876,36 @@ class DotProductAttention(BaseAttentionLayer):
       One use case is beam search where n = beam size.
 
       Args:
-        per_dim_scale:            [source_dim], a vec to scale individual dims.
-        source_padding:           [time, source_batch].
-        concated_source_vecs:     [time, source_batch, source_dim].
-        query_vec:                [target_batch, source_dim].
-        per_step_source_padding:  [target_batch, source_length]
-        source_segment_id:        [time, source_batch].
-        query_segment_id:         [target_batch].
+        inputs: a NestedMap containing:
+          - per_dim_scale:         [source_dim], a vec to scale individual dims.
+          - source_padding:          [time, source_batch].
+          - concated_source_vecs:    [source_batch, time, source_dim].
+          - query_vec:               [target_batch, source_dim].
+          - per_step_source_padding: [target_batch, source_length]
+          - source_segment_id:       [time, source_batch].
+          - query_segment_id:        [target_batch].
 
       Returns:
         logits [target_batch, source_time].
       """
-      source_padding = tf.transpose(source_padding)
-      concated_source_vecs = tf.transpose(concated_source_vecs, [1, 0, 2])
-      concated_source_vecs = tf.identity(
-          concated_source_vecs, name='concated_source_vecs')
+      source_padding = tf.transpose(inputs.source_padding)
+      concated_source_vecs = inputs.concated_source_vecs
 
       logit_scale = tf.stop_gradient(
           tf.math.rsqrt(
               tf.cast(
-                  py_utils.GetShape(query_vec)[1],
+                  py_utils.GetShape(inputs.query_vec)[1],
                   dtype=py_utils.FPropDtype(p))))
       source_batch = py_utils.GetShape(concated_source_vecs)[0]
-      target_batch = py_utils.GetShape(query_vec)[0]
-      query_vec *= per_dim_scale
+      target_batch = py_utils.GetShape(inputs.query_vec)[0]
+      query_vec = inputs.query_vec * inputs.per_dim_scale
       # The n here refers to the "n" described in the comment above.
       n = target_batch // source_batch
       query_vec = tf.reshape(query_vec, [n, source_batch, -1])
       # => [source_batch, source_dim, n]
       query_vec = tf.transpose(query_vec, [1, 2, 0])
       # => [n, source_batch, source_sequence_len]
-      per_step_source_padding = tf.reshape(per_step_source_padding,
+      per_step_source_padding = tf.reshape(inputs.per_step_source_padding,
                                            [n, source_batch, -1])
       # => [source_batch, source_sequence_len, n]
       per_step_source_padding = tf.transpose(per_step_source_padding, [1, 2, 0])
@@ -914,7 +922,7 @@ class DotProductAttention(BaseAttentionLayer):
       if p.packed_input:
         source_padding = tf.transpose(source_padding, [1, 2, 0])
         source_padding = self._UpdatePaddingWithPackedInputMask(
-            source_padding, source_segment_id, query_segment_id)
+            source_padding, inputs.source_segment_id, inputs.query_segment_id)
         source_padding = tf.transpose(source_padding, [1, 2, 0])
       else:
         source_padding = tf.transpose(source_padding, [2, 0, 1])
@@ -964,10 +972,19 @@ class DotProductAttention(BaseAttentionLayer):
       source_batch = py_utils.GetShape(concated_source_vecs)[1]
       target_batch = py_utils.GetShape(query_vec)[0]
       n = target_batch // source_batch
-      returned_probs = AttenProbs(per_dim_scale, source_padding,
-                                  concated_source_vecs, query_vec,
-                                  per_step_source_padding, source_segment_id,
-                                  query_segment_id)
+      concated_source_vecs = tf.transpose(concated_source_vecs, [1, 0, 2])
+      concated_source_vecs = tf.identity(
+          concated_source_vecs, name='concated_source_vecs')
+      returned_probs = py_utils.CallDefun(
+          AttenProbs,
+          py_utils.NestedMap(
+              per_dim_scale=per_dim_scale,
+              source_padding=source_padding,
+              concated_source_vecs=concated_source_vecs,
+              query_vec=query_vec,
+              per_step_source_padding=per_step_source_padding,
+              source_segment_id=source_segment_id,
+              query_segment_id=query_segment_id))
       returned_probs.set_shape(per_step_source_padding.shape)
 
       # => [n, source_batch, time].
@@ -994,17 +1011,18 @@ class DotProductAttention(BaseAttentionLayer):
 
     self._ctx_vec = Atten
 
-  def _CreateVariables(self):
-    super()._CreateVariables()
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     p = self.params
 
-    pc = py_utils.WeightParams(
-        shape=[p.hidden_dim],
-        init=py_utils.WeightInit.Constant(0.0),
-        dtype=p.dtype,
-        collections=['DotProductAttention_vars'])
+    if p.use_dim_scale:
+      pc = py_utils.WeightParams(
+          shape=[p.hidden_dim],
+          init=py_utils.WeightInit.Constant(0.0),
+          dtype=p.dtype,
+          collections=['DotProductAttention_vars'])
 
-    self.CreateVariable('per_dim_scale', pc)
+      self.CreateVariable('per_dim_scale', pc)
 
   def PackSource(self,
                  theta,
@@ -1107,8 +1125,13 @@ class DotProductAttention(BaseAttentionLayer):
     def ScaleFn(x):
       return tf.nn.softplus(x) / tf.nn.softplus(tf.constant(0.0, dtype=x.dtype))
 
+    if self.params.use_dim_scale:
+      per_dim_scale_var = theta.per_dim_scale
+    else:
+      per_dim_scale_var = tf.constant(0.0, dtype=query_vec.dtype)
+
     ctx_vec, prob = self._ctx_vec(
-        ScaleFn(theta.per_dim_scale), source_padding, source_segment_id,
+        ScaleFn(per_dim_scale_var), source_padding, source_segment_id,
         concated_source_vecs, concated_source_contexts, query_vec,
         query_segment_id, per_step_source_padding, theta.global_step)
     return ctx_vec, prob, attention_state
@@ -1184,6 +1207,10 @@ class MultiHeadedAttention(BaseAttentionLayer, quant_utils.QuantizableLayer):
         'the probabilities of all attention heads when returning the '
         'attention probability, instead return the selected index prob.')
 
+    p.Define('use_bias', True, 'Whether to use bias for projection layer.')
+    p.Define('enable_per_dim_scale', True,
+             'Whether to use per_dim_scale in inner_atten.')
+
     # Often the attention context output needs to be concated
     # with tensors from another layer. This allows them to share
     # quantization parameters. By convention, all attention layers
@@ -1201,38 +1228,31 @@ class MultiHeadedAttention(BaseAttentionLayer, quant_utils.QuantizableLayer):
     p = self.params
     assert symbolic.ToStatic(p.hidden_dim) % p.num_attention_heads == 0
 
-    self.TrackQTensor('source_proj_matmul', 'source_proj_add',
-                      'query_proj_matmul', 'query_proj_add',
-                      'ctx_pre_proj_matmul', 'ctx_pre_proj_add')
-    # TODO(suderman): Remove the self.do_eval check below once brop quant within
-    # defun is fixed on the training side. This is less than ideal as-is because
-    # training will just trend to match downstream quant constraints vs force
-    # alignment.
-    self.TrackQTensor(
-        'ctx_post_proj_matmul', 'ctx_post_proj_add', domain='atten_context')
-
     if p.proj_init not in ('uniform', 'default'):
       raise ValueError('Unknown proj_init: %s!' % p.proj_init)
 
-    with tf.variable_scope(p.name):
-      att_dim = p.hidden_dim // p.num_attention_heads
+    att_dim = p.hidden_dim // p.num_attention_heads
 
-      att_p = p.inner_atten_params.Set(
-          source_dim=att_dim,
-          query_dim=att_dim,
-          hidden_dim=att_dim,
-          dtype=p.dtype,
-          atten_dropout_prob=p.atten_dropout_prob,
-          atten_dropout_deterministic=p.atten_dropout_deterministic,
-          packed_input=p.packed_input)
-      if not att_p.name:
-        att_p.name = 'inner_att'
-      self.CreateChild('atten', att_p)
-      if p.attention_head_prob_index >= 0:
-        assert p.attention_head_prob_index < p.num_attention_heads
+    att_p = p.inner_atten_params.Set(
+        source_dim=att_dim,
+        query_dim=att_dim,
+        hidden_dim=att_dim,
+        dtype=p.dtype,
+        atten_dropout_prob=p.atten_dropout_prob,
+        atten_dropout_deterministic=p.atten_dropout_deterministic,
+        packed_input=p.packed_input)
 
-  def _CreateVariables(self):
-    super()._CreateVariables()
+    if att_p.cls == DotProductAttention:
+      att_p.use_dim_scale = p.enable_per_dim_scale
+
+    if not att_p.name:
+      att_p.name = 'inner_att'
+    self.CreateChild('atten', att_p)
+    if p.attention_head_prob_index >= 0:
+      assert p.attention_head_prob_index < p.num_attention_heads
+
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     p = self.params
 
     def InitProj(layer_dim, bias=False):
@@ -1245,11 +1265,12 @@ class MultiHeadedAttention(BaseAttentionLayer, quant_utils.QuantizableLayer):
         proj_init = py_utils.WeightInit.Constant(0.0) if bias else p.params_init
       return proj_init
 
-    pc_bias = py_utils.WeightParams(
-        shape=[p.hidden_dim],
-        init=InitProj(p.hidden_dim, bias=True),
-        dtype=p.dtype,
-        collections=[self.__class__.__name__ + '_vars'])
+    if p.use_bias:
+      pc_bias = py_utils.WeightParams(
+          shape=[p.hidden_dim],
+          init=InitProj(p.hidden_dim, bias=True),
+          dtype=p.dtype,
+          collections=[self.__class__.__name__ + '_vars'])
 
     if p.enable_source_proj:
       pc = py_utils.WeightParams(
@@ -1258,7 +1279,8 @@ class MultiHeadedAttention(BaseAttentionLayer, quant_utils.QuantizableLayer):
           dtype=p.dtype,
           collections=[self.__class__.__name__ + '_vars'])
       self.CreateVariable('source_proj', pc)
-      self.CreateVariable('source_proj_b', pc_bias)
+      if p.use_bias:
+        self.CreateVariable('source_proj_b', pc_bias)
     else:
       assert p.source_dim == p.hidden_dim
 
@@ -1269,7 +1291,8 @@ class MultiHeadedAttention(BaseAttentionLayer, quant_utils.QuantizableLayer):
           dtype=p.dtype,
           collections=[self.__class__.__name__ + '_vars'])
       self.CreateVariable('query_proj', pc)
-      self.CreateVariable('query_proj_b', pc_bias)
+      if p.use_bias:
+        self.CreateVariable('query_proj_b', pc_bias)
     else:
       assert p.query_dim == p.hidden_dim
 
@@ -1281,7 +1304,8 @@ class MultiHeadedAttention(BaseAttentionLayer, quant_utils.QuantizableLayer):
           dtype=p.dtype,
           collections=[self.__class__.__name__ + '_vars'])
       self.CreateVariable('ctx_proj', pc)
-      self.CreateVariable('ctx_proj_b', pc_bias)
+      if p.use_bias:
+        self.CreateVariable('ctx_proj_b', pc_bias)
 
     if p.enable_ctx_post_proj:
       assert p.ctx_post_proj_dim
@@ -1299,12 +1323,23 @@ class MultiHeadedAttention(BaseAttentionLayer, quant_utils.QuantizableLayer):
           dtype=p.dtype,
           collections=[self.__class__.__name__ + '_vars'])
       self.CreateVariable('ctx_post_proj', pc)
-      pc_bias_post_proj = py_utils.WeightParams(
-          shape=pc_b_shape,
-          init=InitProj(p.ctx_post_proj_dim, bias=True),
-          dtype=p.dtype,
-          collections=[self.__class__.__name__ + '_vars'])
-      self.CreateVariable('ctx_post_proj_b', pc_bias_post_proj)
+      if p.use_bias:
+        pc_bias_post_proj = py_utils.WeightParams(
+            shape=pc_b_shape,
+            init=InitProj(p.ctx_post_proj_dim, bias=True),
+            dtype=p.dtype,
+            collections=[self.__class__.__name__ + '_vars'])
+        self.CreateVariable('ctx_post_proj_b', pc_bias_post_proj)
+
+    self.TrackQTensor('source_proj_matmul', 'source_proj_add',
+                      'query_proj_matmul', 'query_proj_add',
+                      'ctx_pre_proj_matmul', 'ctx_pre_proj_add')
+    # TODO(suderman): Remove the self.do_eval check below once brop quant within
+    # defun is fixed on the training side. This is less than ideal as-is because
+    # training will just trend to match downstream quant constraints vs force
+    # alignment.
+    self.TrackQTensor(
+        'ctx_post_proj_matmul', 'ctx_post_proj_add', domain='atten_context')
 
   @classmethod
   def SetOutputContextDim(cls, p, out_dim):
@@ -1356,10 +1391,11 @@ class MultiHeadedAttention(BaseAttentionLayer, quant_utils.QuantizableLayer):
                   tf.reshape(source_vecs, [-1, source_vec_depth]),
                   fns.qweight(theta.source_proj),
                   qt='source_proj_matmul'))
-          source_projected = fns.qadd(
-              source_projected,
-              fns.qweight(theta.source_proj_b),
-              qt='source_proj_add')
+          if p.use_bias:
+            source_projected = fns.qadd(
+                source_projected,
+                fns.qweight(theta.source_proj_b),
+                qt='source_proj_add')
         else:
           source_projected = tf.reshape(source_vecs, [-1, source_vec_depth])
     with tf.name_scope('init__1'):
@@ -1380,10 +1416,11 @@ class MultiHeadedAttention(BaseAttentionLayer, quant_utils.QuantizableLayer):
                          [-1, py_utils.GetShape(source_contexts)[2]]),
               fns.qweight(theta.ctx_proj),
               qt='ctx_pre_proj_matmul')
-          source_contexts_projected = fns.qadd(
-              source_contexts_projected,
-              fns.qweight(theta.ctx_proj_b),
-              qt='ctx_pre_proj_add')
+          if p.use_bias:
+            source_contexts_projected = fns.qadd(
+                source_contexts_projected,
+                fns.qweight(theta.ctx_proj_b),
+                qt='ctx_pre_proj_add')
         else:
           source_contexts_projected = source_contexts
 
@@ -1588,10 +1625,11 @@ class MultiHeadedAttention(BaseAttentionLayer, quant_utils.QuantizableLayer):
     if p.enable_query_proj:
       query_vec_projected = fns.qbatchmatmul(
           query_vec, fns.qweight(theta.query_proj), qt='query_proj_matmul')
-      query_vec_projected = fns.qadd(
-          query_vec_projected,
-          fns.qweight(theta.query_proj_b),
-          qt='query_proj_add')
+      if p.use_bias:
+        query_vec_projected = fns.qadd(
+            query_vec_projected,
+            fns.qweight(theta.query_proj_b),
+            qt='query_proj_add')
       query_vec_projected = tf.reshape(query_vec_projected,
                                        query_vec_projected_shape)
       query_vec_projected = self.ProcessProjectionVec(theta,
@@ -1640,8 +1678,11 @@ class MultiHeadedAttention(BaseAttentionLayer, quant_utils.QuantizableLayer):
             ctx_vec,
             fns.qweight(theta.ctx_post_proj),
             qt='ctx_post_proj_matmul')
-        ctx_vec = fns.qadd(
-            ctx_vec, fns.qweight(theta.ctx_post_proj_b), qt='ctx_post_proj_add')
+        if p.use_bias:
+          ctx_vec = fns.qadd(
+              ctx_vec,
+              fns.qweight(theta.ctx_post_proj_b),
+              qt='ctx_post_proj_add')
       else:
         assert p.num_post_proj > 1, (
             'atten_idx is not None, this means there are multiple post '
@@ -1651,7 +1692,8 @@ class MultiHeadedAttention(BaseAttentionLayer, quant_utils.QuantizableLayer):
         select = tf.transpose(tf.concat([bs_range, [atten_idx]], axis=0))
         # => [batch, dim, num_langs]
         ctx_vec = tf.einsum('ab,bcd->acd', ctx_vec, theta.ctx_post_proj)
-        ctx_vec += tf.expand_dims(theta.ctx_post_proj_b, 0)
+        if p.use_bias:
+          ctx_vec += tf.expand_dims(theta.ctx_post_proj_b, 0)
         # => [batch, num_langs, dim]
         ctx_vec = tf.transpose(ctx_vec, [0, 2, 1])
         # => [batch, dim]
@@ -1833,20 +1875,7 @@ class LocationSensitiveAttention(BaseAttentionLayer):
     if p.atten_dropout_prob != 0:
       raise NotImplementedError('dropout is not supported')
 
-    self.TrackQTensor('atten_conv')
-    self.TrackQTensor('atten_context', domain='atten_context')
-    self.TrackQTensor(
-        'atten_matmul',
-        'logits_add',
-        'encode_matmul',
-        'logits_mul',
-        'logits_bias',
-        domain='fullyconnected')
-
-    @_ConditionalDefun(
-        self._is_quantized, *[p.dtype] * 5, noinline=not py_utils.use_tpu())
-    def AttenLogits(concated_source_vecs, query_vec_reshaped, hidden_v,
-                    location_feats, location_var):
+    def AttenLogits(inputs):
       """Generates logits."""
       fns = self.fns
 
@@ -1854,21 +1883,23 @@ class LocationSensitiveAttention(BaseAttentionLayer):
         return tf.reshape(x, [-1, tf.shape(x)[-1]])
 
       # => [sl, sb, hd]
-      location_feats = tf.transpose(location_feats, [2, 0, 1])
+      location_feats = tf.transpose(inputs.location_feats, [2, 0, 1])
       location_hidden = fns.qmatmul(
-          CollapseOutDim(location_feats), location_var, qt='logits_mul')
+          CollapseOutDim(location_feats), inputs.location_var, qt='logits_mul')
 
       sl = py_utils.GetShape(location_feats)[0]
       tb = py_utils.GetShape(location_feats)[1]
-      hd = py_utils.GetShape(location_var)[1]
+      hd = py_utils.GetShape(inputs.location_var)[1]
       location_hidden = tf.reshape(location_hidden, [sl, tb, hd])
-      sb = py_utils.GetShape(query_vec_reshaped)[2]
-      bs_mult = py_utils.GetShape(query_vec_reshaped)[1]
+      sb = py_utils.GetShape(inputs.query_vec_reshaped)[2]
+      bs_mult = py_utils.GetShape(inputs.query_vec_reshaped)[1]
       location_hidden = tf.reshape(location_hidden, [sl, bs_mult, sb, hd])
 
       # Shape of summed is [sl, tb/sb, sb, hidden_dim].
       summed = fns.qadd(
-          concated_source_vecs, query_vec_reshaped, qt='logits_add')
+          inputs.concated_source_vecs,
+          inputs.query_vec_reshaped,
+          qt='logits_add')
       summed = fns.qadd(summed, location_hidden, qt='logits_bias')
       summed = fns.qtanh(summed)
       # logits is of shape [sl * tb/sb * sb, 1]. Computes dot product
@@ -1876,26 +1907,24 @@ class LocationSensitiveAttention(BaseAttentionLayer):
       # result to be of shape [sl, tb/sb, sb].
       logits = fns.qmatmul(
           tf.reshape(summed, [-1, p.hidden_dim]),
-          tf.reshape(hidden_v, [p.hidden_dim, 1]),
+          tf.reshape(inputs.hidden_v, [p.hidden_dim, 1]),
           qt='logits')
       logits = tf.reshape(logits, py_utils.GetShape(summed)[:3])
       return logits
 
-    @_ConditionalDefun(
-        not self._is_quantized, *[p.dtype] * 5, noinline=not py_utils.use_tpu())
-    def AttenLogitsSameBatchSize(concated_source_vecs, query_vec_transformed,
-                                 hidden_v, location_feats, location_var):
+    def AttenLogitsSameBatchSize(inputs):
       """Generates logits.
 
       Optimized code path for when the target and the source have the same batch
       size.
 
       Args:
-        concated_source_vecs: Tensor of shape [sl, batch, dim]
-        query_vec_transformed: Tensor of shape [batch, dim]
-        hidden_v: Tensor of shape [dim]
-        location_feats: Tensor of shape [batch, location_feature_dim, sl]
-        location_var: Tensor of shape [location_feature_dim, dim]
+        inputs: a NestedMap containing:
+          - concated_source_vecs: Tensor of shape [sl, batch, dim]
+          - query_vec_transformed: Tensor of shape [batch, dim]
+          - hidden_v: Tensor of shape [dim]
+          - location_feats: Tensor of shape [batch, location_feature_dim, sl]
+          - location_var: Tensor of shape [location_feature_dim, dim]
 
       Returns:
         logits in the shape [sl, batch_size].
@@ -1906,18 +1935,18 @@ class LocationSensitiveAttention(BaseAttentionLayer):
 
       fns = self.fns
       # => [sl, sb, hd]
-      location_feats = tf.transpose(location_feats, [2, 0, 1])
+      location_feats = tf.transpose(inputs.location_feats, [2, 0, 1])
       location_hidden = fns.qmatmul(
-          CollapseOutDim(location_feats), location_var, qt='logits_mul')
+          CollapseOutDim(location_feats), inputs.location_var, qt='logits_mul')
       sl = tf.shape(location_feats)[0]
       tb = tf.shape(location_feats)[1]
-      hd = tf.shape(location_var)[1]
+      hd = tf.shape(inputs.location_var)[1]
       location_hidden = tf.reshape(location_hidden, [sl, tb, hd])
 
       # Shape of summed is [sl, sb, hidden_dim].
       summed = fns.qadd(
-          concated_source_vecs,
-          tf.expand_dims(query_vec_transformed, 0),
+          inputs.concated_source_vecs,
+          tf.expand_dims(inputs.query_vec_transformed, 0),
           qt='logits_add')
 
       summed = fns.qadd(summed, location_hidden, qt='logits_bias')
@@ -1928,7 +1957,7 @@ class LocationSensitiveAttention(BaseAttentionLayer):
       # result to be of shape [sl, tb].
       logits = fns.qmatmul(
           tf.reshape(summed, [-1, p.hidden_dim]),
-          tf.reshape(hidden_v, [p.hidden_dim, 1]),
+          tf.reshape(inputs.hidden_v, [p.hidden_dim, 1]),
           qt='logits')
       logits = tf.reshape(logits, py_utils.GetShape(summed)[:2])
       return logits
@@ -1960,8 +1989,14 @@ class LocationSensitiveAttention(BaseAttentionLayer):
       query_vec_reshaped = tf.reshape(query_vec_transformed,
                                       [1, multiplier, sb, p.hidden_dim])
       # logits is of shape [sl, tb/sb, sb]
-      logits = AttenLogits(concated_source_vecs, query_vec_reshaped, hidden_var,
-                           location_feats, location_var)
+      logits = _ConditionalCallDefun(
+          self._is_quantized, AttenLogits,
+          py_utils.NestedMap(
+              concated_source_vecs=concated_source_vecs,
+              query_vec_reshaped=query_vec_reshaped,
+              hidden_v=hidden_var,
+              location_feats=location_feats,
+              location_var=location_var))
       # Take out the padding states.
       # _source_padding is of shape [sl, sb].
       # reshaped to [sl, 1,  sb].
@@ -2011,9 +2046,14 @@ class LocationSensitiveAttention(BaseAttentionLayer):
       query_vec_transformed = fns.qmatmul(
           query_vec, query_var, qt='atten_matmul')
       # logits is of shape [sl, sb]
-      logits = AttenLogitsSameBatchSize(concated_source_vecs,
-                                        query_vec_transformed, hidden_var,
-                                        location_feats, location_var)
+      logits = _ConditionalCallDefun(
+          not self._is_quantized, AttenLogitsSameBatchSize,
+          py_utils.NestedMap(
+              concated_source_vecs=concated_source_vecs,
+              query_vec_transformed=query_vec_transformed,
+              hidden_v=hidden_var,
+              location_feats=location_feats,
+              location_var=location_var))
       # => [sl, tb]
       logits.set_shape(source_padding.shape)
       # Reshape logits to a matrix of shape [tb, sl] and takes the
@@ -2046,8 +2086,8 @@ class LocationSensitiveAttention(BaseAttentionLayer):
 
     self._encode_source = EncodeSource
 
-  def _CreateVariables(self):
-    super()._CreateVariables()
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     p = self.params
 
     pc = py_utils.WeightParams(
@@ -2093,6 +2133,16 @@ class LocationSensitiveAttention(BaseAttentionLayer):
         dtype=p.dtype,
         collections=['LocationSensitiveAttention_vars'])
     self.CreateVariable('location_var', location_pc, self.AddGlobalVN)
+
+    self.TrackQTensor('atten_conv')
+    self.TrackQTensor('atten_context', domain='atten_context')
+    self.TrackQTensor(
+        'atten_matmul',
+        'logits_add',
+        'encode_matmul',
+        'logits_mul',
+        'logits_bias',
+        domain='fullyconnected')
 
   def _ApplyConv(self, attention_state, location_filter_var):
     """Applies the convolution on attention state."""
@@ -2344,8 +2394,8 @@ class MonotonicAttention(BaseAttentionLayer):
 
     self._encode_source = EncodeSource
 
-  def _CreateVariables(self):
-    super()._CreateVariables()
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     p = self.params
 
     # source is the weight matrix for the memory/encoder states
@@ -2445,37 +2495,36 @@ class MonotonicAttention(BaseAttentionLayer):
     multiplier = tb // sb
 
     p = self.params
-    # noinline and compiled cannot be set at the same time
-    @tf.Defun(*([p.dtype] * 7), noinline=not py_utils.use_tpu())
-    def AttenLogits(concated_source_vecs, query_vec, query_v, energy_b,
-                    hidden_v, hidden_g, hidden_b):
+
+    def AttenLogits(inputs):
       """Computes logits from source, query, and variables.
 
       Args:
-        concated_source_vecs: [sl, sb, hidden_dims].
-        query_vec: [tb, query_dim].
-        query_v: [query_dim, hidden_dim]
-        energy_b: [hidden_dim].
-        hidden_v: [hidden_dim].
-        hidden_g: [].
-        hidden_b: [].
+        inputs: a NestedMap containing:
+          - concated_source_vecs: [sl, sb, hidden_dims].
+          - query_vec: [tb, query_dim].
+          - query_v: [query_dim, hidden_dim]
+          - energy_b: [hidden_dim].
+          - hidden_v: [hidden_dim].
+          - hidden_g: [].
+          - hidden_b: [].
 
       Returns:
         logits shaped [tb, sl].
       """
       # Apply query matrix to query. Becomes [tb, hidden_dim].
       query_vec_transformed = py_utils.Matmul(
-          query_vec, query_v, name='query_transformation')
+          inputs.query_vec, inputs.query_v, name='query_transformation')
       # query_vec is reshaped to [1, tb/sb, sb, hidden_dim].
       query_vec_reshaped = tf.reshape(query_vec_transformed,
                                       [1, multiplier, sb, p.hidden_dim])
 
       # [sl, 1, sb, hidden_dim].
-      concated_source_vecs = tf.expand_dims(concated_source_vecs, 1)
-      energy_b = tf.reshape(energy_b, [1, 1, 1, -1])
+      concated_source_vecs = tf.expand_dims(inputs.concated_source_vecs, 1)
+      energy_b = tf.reshape(inputs.energy_b, [1, 1, 1, -1])
       # Shape of summed is [sl, tb/sb, sb, hidden_dim].
       summed = tf.tanh(concated_source_vecs + query_vec_reshaped + energy_b)
-      hidden_v = hidden_g * tf.nn.l2_normalize(hidden_v, axis=0)
+      hidden_v = inputs.hidden_g * tf.nn.l2_normalize(inputs.hidden_v, axis=0)
       # logits is of shape [sl * tb/sb * sb, 1]. Computes dot product
       # between v with every rows in 'summed'. Then we reshape the
       # result to be of shape [sl, tb/sb, sb].
@@ -2486,15 +2535,22 @@ class MonotonicAttention(BaseAttentionLayer):
       logits = py_utils.Matmul(
           tf.reshape(summed, [-1, p.hidden_dim]),
           tf.reshape(hidden_v, [p.hidden_dim, 1]))
-      logits += hidden_b
+      logits += inputs.hidden_b
       # [tb, sl].
       logits = tf.transpose(tf.reshape(logits, [-1, tb]), [1, 0])
       return logits
 
     with tf.name_scope('logits'):
-      logits = AttenLogits(concated_source_vecs, query_vec, theta.query_var,
-                           theta.energy_bias_var, theta.hidden_var,
-                           theta.hidden_scale_var, theta.hidden_bias_var)
+      logits = py_utils.CallDefun(
+          AttenLogits,
+          py_utils.NestedMap(
+              concated_source_vecs=concated_source_vecs,
+              query_vec=query_vec,
+              query_v=theta.query_var,
+              energy_b=theta.energy_bias_var,
+              hidden_v=theta.hidden_var,
+              hidden_g=theta.hidden_scale_var,
+              hidden_b=theta.hidden_bias_var))
 
     previous_attention = attention_state.emit_probs
     with tf.name_scope('prob'):
@@ -2624,129 +2680,127 @@ class GmmMonotonicAttention(BaseAttentionLayer):
       raise NotImplementedError('dropout is not supported.')
 
     # TODO(ngyuzh): Compare Sigmoid and other activation functions.
-    with tf.variable_scope(p.name):
-      ff_params = layers.FeedForwardNet.Params().Set(
-          name=p.name,
-          input_dim=p.query_dim,
-          hidden_layer_dims=[p.hidden_dim, p.num_mixtures * 3],
-          activation=['SIGMOID', 'NONE'],
-          params_init=p.params_init.Copy())
-      self.CreateChild('GMM', ff_params)
+    ff_params = layers.FeedForwardNet.Params().Set(
+        name=p.name,
+        input_dim=p.query_dim,
+        hidden_layer_dims=[p.hidden_dim, p.num_mixtures * 3],
+        activation=['SIGMOID', 'NONE'],
+        params_init=p.params_init.Copy())
+    self.CreateChild('GMM', ff_params)
 
-      def ComputeProbs(encoder_positions, priors, means, variances):
-        """Computes the location GMM probabilities at all encoder positions.
+    def ComputeProbs(encoder_positions, priors, means, variances):
+      """Computes the location GMM probabilities at all encoder positions.
 
-        This function assumes that the first 2 dimensions of `priors`, `means`,
-        `variances`, and the return value:
-        `multiplier (target_batch / source_batch)` and `source_batch` are
-        transposed, and `encoder_positions` has only non-one dimensions.
+      This function assumes that the first 2 dimensions of `priors`, `means`,
+      `variances`, and the return value:
+      `multiplier (target_batch / source_batch)` and `source_batch` are
+      transposed, and `encoder_positions` has only non-one dimensions.
 
-        Args:
-          encoder_positions: [source_batch, source_length]
-          priors: [multiplier, source_batch, num_mixtures]
-          means: [multiplier, source_batch, num_mixtures]
-          variances: [multiplier, source_batch, num_mixtures]
+      Args:
+        encoder_positions: [source_batch, source_length]
+        priors: [multiplier, source_batch, num_mixtures]
+        means: [multiplier, source_batch, num_mixtures]
+        variances: [multiplier, source_batch, num_mixtures]
 
-        Returns:
-          Probabilities shaped [multiplier, source_batch, source_length].
-        """
-        # [multiplier, source_batch, 1, num_mixtures]
-        priors = tf.expand_dims(priors, 2)
-        means = tf.expand_dims(means, 2)
-        variances = tf.expand_dims(variances, 2)
-        epsilon = 1e-8
+      Returns:
+        Probabilities shaped [multiplier, source_batch, source_length].
+      """
+      # [multiplier, source_batch, 1, num_mixtures]
+      priors = tf.expand_dims(priors, 2)
+      means = tf.expand_dims(means, 2)
+      variances = tf.expand_dims(variances, 2)
+      epsilon = 1e-8
 
-        # [source_batch, source_length, 1]
-        encoder_positions = tf.expand_dims(encoder_positions, 2)
+      # [source_batch, source_length, 1]
+      encoder_positions = tf.expand_dims(encoder_positions, 2)
 
-        # [multiplier, source_batch, source_length, num_mixtures]
-        probs = ((priors * tf.math.rsqrt(2 * np.pi * variances + epsilon)) *
-                 tf.exp(-(encoder_positions - means)**2 /
-                        (2 * variances + epsilon)))
+      # [multiplier, source_batch, source_length, num_mixtures]
+      probs = ((priors * tf.math.rsqrt(2 * np.pi * variances + epsilon)) *
+               tf.exp(-(encoder_positions - means)**2 /
+                      (2 * variances + epsilon)))
 
-        # [multiplier, source_batch, source_length]
-        return tf.reduce_sum(probs, axis=3)
+      # [multiplier, source_batch, source_length]
+      return tf.reduce_sum(probs, axis=3)
 
-      def Atten(source_padding, concated_source_vecs, concated_source_contexts,
-                query_vec, priors, means, variances, encoder_positions,
-                per_step_source_padding):
-        """Computes the attention context vector.
+    def Atten(source_padding, concated_source_vecs, concated_source_contexts,
+              query_vec, priors, means, variances, encoder_positions,
+              per_step_source_padding):
+      """Computes the attention context vector.
 
-        Args:
-          source_padding: [source_length, source_batch]
-          concated_source_vecs: [source_length, source_batch, hidden_dim]
-          concated_source_contexts: [source_batch, source_length, context_dim]
-          query_vec: [target_batch, query_dim]
-          priors: [target_batch, num_mixtures]
-          means: [target_batch, num_mixtures]
-          variances: [target_batch, num_mixtures]
-          encoder_positions: [source_batch, source_length]
-          per_step_source_padding: [target_batch, source_length]
+      Args:
+        source_padding: [source_length, source_batch]
+        concated_source_vecs: [source_length, source_batch, hidden_dim]
+        concated_source_contexts: [source_batch, source_length, context_dim]
+        query_vec: [target_batch, query_dim]
+        priors: [target_batch, num_mixtures]
+        means: [target_batch, num_mixtures]
+        variances: [target_batch, num_mixtures]
+        encoder_positions: [source_batch, source_length]
+        per_step_source_padding: [target_batch, source_length]
 
-        Returns:
-          Tuple(context vector, atten probs):
+      Returns:
+        Tuple(context vector, atten probs):
 
-          - context vector: [target_batch, context_dim]
-          - attention probabilities: [target_batch, source_length]
-        """
-        # Note: shape [target_batch] can be converted to
-        # [multiplier, source_batch], not [source_batch, multiplier].
-        p = self.params
-        source_batch = tf.shape(concated_source_vecs)[1]
-        target_batch = tf.shape(query_vec)[0]
-        multiplier = target_batch // source_batch
+        - context vector: [target_batch, context_dim]
+        - attention probabilities: [target_batch, source_length]
+      """
+      # Note: shape [target_batch] can be converted to
+      # [multiplier, source_batch], not [source_batch, multiplier].
+      p = self.params
+      source_batch = tf.shape(concated_source_vecs)[1]
+      target_batch = tf.shape(query_vec)[0]
+      multiplier = target_batch // source_batch
 
-        # [multiplier, source_batch, num_mixtures]
-        priors = tf.reshape(priors, [multiplier, source_batch, p.num_mixtures])
-        means = tf.reshape(means, [multiplier, source_batch, p.num_mixtures])
-        variances = tf.reshape(variances,
-                               [multiplier, source_batch, p.num_mixtures])
+      # [multiplier, source_batch, num_mixtures]
+      priors = tf.reshape(priors, [multiplier, source_batch, p.num_mixtures])
+      means = tf.reshape(means, [multiplier, source_batch, p.num_mixtures])
+      variances = tf.reshape(variances,
+                             [multiplier, source_batch, p.num_mixtures])
 
-        # [multiplier, source_batch, source_length]
-        probs = ComputeProbs(encoder_positions, priors, means, variances)
+      # [multiplier, source_batch, source_length]
+      probs = ComputeProbs(encoder_positions, priors, means, variances)
 
-        # [source_batch, source_length]
-        source_padding = tf.transpose(source_padding)
+      # [source_batch, source_length]
+      source_padding = tf.transpose(source_padding)
 
-        # [multiplier, source_batch, source_length]
-        per_step_source_padding = tf.reshape(per_step_source_padding,
-                                             [multiplier, source_batch, -1])
-        source_padding += per_step_source_padding
-        source_padding = tf.minimum(source_padding, 1.0)
+      # [multiplier, source_batch, source_length]
+      per_step_source_padding = tf.reshape(per_step_source_padding,
+                                           [multiplier, source_batch, -1])
+      source_padding += per_step_source_padding
+      source_padding = tf.minimum(source_padding, 1.0)
 
-        # [multiplier, source_batch, source_length]
-        probs *= (1.0 - source_padding)
-        if p.normalize_probs:
-          probs /= tf.maximum(
-              tf.reduce_sum(probs, axis=2, keepdims=True), 1e-12)
+      # [multiplier, source_batch, source_length]
+      probs *= (1.0 - source_padding)
+      if p.normalize_probs:
+        probs /= tf.maximum(tf.reduce_sum(probs, axis=2, keepdims=True), 1e-12)
 
-        # [source_batch, multiplier, source_length]
-        probs_transposed = tf.transpose(probs, [1, 0, 2])
+      # [source_batch, multiplier, source_length]
+      probs_transposed = tf.transpose(probs, [1, 0, 2])
 
-        # Matmul:
-        # [source_batch, multiplier, source_length]
-        # @ [source_batch, source_length, context_dim]
-        # -> [source_batch, multiplier, context_dim]
-        context_vector_transposed = tf.matmul(probs_transposed,
-                                              concated_source_contexts)
+      # Matmul:
+      # [source_batch, multiplier, source_length]
+      # @ [source_batch, source_length, context_dim]
+      # -> [source_batch, multiplier, context_dim]
+      context_vector_transposed = tf.matmul(probs_transposed,
+                                            concated_source_contexts)
 
-        # [multiplier, source_batch, context_dim]
-        context_vector = tf.transpose(context_vector_transposed, [1, 0, 2])
+      # [multiplier, source_batch, context_dim]
+      context_vector = tf.transpose(context_vector_transposed, [1, 0, 2])
 
-        # [target_batch, context_dim], [target_batch, source_length]
-        return (tf.reshape(context_vector, [target_batch, -1]),
-                tf.reshape(probs, [target_batch, -1]))
+      # [target_batch, context_dim], [target_batch, source_length]
+      return (tf.reshape(context_vector, [target_batch, -1]),
+              tf.reshape(probs, [target_batch, -1]))
 
-      self._ctx_vec = Atten
+    self._ctx_vec = Atten
 
-      def EncodeSource(vecs, ctxs):
-        # TODO(ngyuzh): combine with content-base attention.
-        time, batch = py_utils.GetShape(vecs, 2)
-        ctxs = py_utils.HasShape(ctxs, [time, batch, -1])
-        transposed_ctxs = tf.transpose(ctxs, [1, 0, 2])
-        return vecs, transposed_ctxs
+    def EncodeSource(vecs, ctxs):
+      # TODO(ngyuzh): combine with content-base attention.
+      time, batch = py_utils.GetShape(vecs, 2)
+      ctxs = py_utils.HasShape(ctxs, [time, batch, -1])
+      transposed_ctxs = tf.transpose(ctxs, [1, 0, 2])
+      return vecs, transposed_ctxs
 
-      self._encode_source = EncodeSource
+    self._encode_source = EncodeSource
 
   def PackSource(self,
                  theta,
@@ -2924,6 +2978,8 @@ class MergerLayer(base_layer.BaseLayer):
              'Configs template for the gated average layer.')
     p.Define('num_sources', 0, 'If merger_op=weighted_sum, then must specify '
              'num of sources.')
+    p.Define('post_proj', None,
+             'Post projection for the merged context vector.')
     return p
 
   # Merging operation keys supported by this layer.
@@ -2976,8 +3032,11 @@ class MergerLayer(base_layer.BaseLayer):
       params.num_inputs = p.num_sources
       self.CreateChild('gated_average', params)
 
-  def _CreateVariables(self):
-    super()._CreateVariables()
+    if p.post_proj:
+      self.CreateChild('post_proj', p.post_proj)
+
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     p = self.params
 
     if p.merger_op == 'weighted_sum':
@@ -2993,15 +3052,15 @@ class MergerLayer(base_layer.BaseLayer):
       self.CreateVariable('sum_weight', pw)
 
   def _CreateChildrenVariables(self):
-    # Backwards compatibility: manually call child.CreateVariables() outside of
-    # tf.variable_scope(p.name).
+    # Backwards compatibility: manually call child.InstantiateVariables()
+    # outside of tf.variable_scope(p.name).
     if 'atten' in self.children:
-      self.atten.CreateVariables()
+      self.atten.InstantiateVariables()
     if 'gated_average' in self.children:
-      self.gated_average.CreateVariables()
+      self.gated_average.InstantiateVariables()
     if 'pre_proj' in self.children:
       for proj in self.pre_proj:
-        proj.CreateVariables()
+        proj.InstantiateVariables()
     super()._CreateChildrenVariables()
 
   def FProp(self, theta, inputs, query_vec=None):
@@ -3098,6 +3157,9 @@ class MergerLayer(base_layer.BaseLayer):
     else:
       raise ValueError('Unrecognized merge op!')
 
+    if p.post_proj:
+      output = self.post_proj.FProp(theta.post_proj, output)
+
     return output
 
 
@@ -3134,23 +3196,22 @@ class MultiSourceAttention(BaseAttentionLayer):
     """Constructs an MultiSourceAttention object."""
     super().__init__(params)
     p = self.params
-    with tf.variable_scope(p.name):
-      for source_key, atten_p in p.source_atten_tpls:
-        child_p = atten_p.Copy()
-        if child_p.query_dim <= 0:
-          child_p.query_dim = p.query_dim
-        else:
-          assert child_p.query_dim == p.query_dim
-        if child_p.source_dim <= 0:
-          child_p.source_dim = p.source_dim
-        self.CreateChild('atten_%s' % source_key, child_p)
+    for source_key, atten_p in p.source_atten_tpls:
+      child_p = atten_p.Copy()
+      if child_p.query_dim <= 0:
+        child_p.query_dim = p.query_dim
+      else:
+        assert child_p.query_dim == p.query_dim
+      if child_p.source_dim <= 0:
+        child_p.source_dim = p.source_dim
+      self.CreateChild('atten_%s' % source_key, child_p)
 
-      # Initialize source context vector merging layer.
-      merger_p = p.atten_merger_tpl.Copy()
-      merger_p.name = 'atten_merger'
-      merger_p.source_dim = p.source_dim
-      merger_p.query_dim = p.query_dim
-      self.CreateChild('atten_merger', merger_p)
+    # Initialize source context vector merging layer.
+    merger_p = p.atten_merger_tpl.Copy()
+    merger_p.name = 'atten_merger'
+    merger_p.source_dim = p.source_dim
+    merger_p.query_dim = p.query_dim
+    self.CreateChild('atten_merger', merger_p)
 
   def PackSource(self,
                  theta,

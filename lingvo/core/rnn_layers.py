@@ -94,9 +94,9 @@ class RNN(base_layer.BaseLayer):
     self.CreateChild('cell', p.cell)
 
   def _CreateChildrenVariables(self):
-    # Backwards compatibility: manually call child.CreateVariables() outside of
-    # tf.variable_scope(p.name).
-    self.cell.CreateVariables()
+    # Backwards compatibility: manually call child.InstantiateVariables()
+    # outside of tf.variable_scope(p.name).
+    self.cell.InstantiateVariables()
     super()._CreateChildrenVariables()
 
   def zero_state(self, theta, batch_size):
@@ -237,14 +237,17 @@ class StackedFRNNLayerByLayer(StackedRNNBase, quant_utils.QuantizableLayer):
 
     self.CreateChildren('rnn', rnn_params)
     self.CreateChild('dropout', p.dropout)
+
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     self.TrackQTensor('residual')
 
   def _CreateChildrenVariables(self):
-    # Backwards compatibility: manually call child.CreateVariables() outside of
-    # tf.variable_scope(p.name).
+    # Backwards compatibility: manually call child.InstantiateVariables()
+    # outside of tf.variable_scope(p.name).
     for rnn in self.rnn:
-      rnn.CreateVariables()
-    self.dropout.CreateVariables()
+      rnn.InstantiateVariables()
+    self.dropout.InstantiateVariables()
     super()._CreateChildrenVariables()
 
   def zero_state(self, theta, batch_size):
@@ -324,14 +327,17 @@ class StackedBiFRNNLayerByLayer(StackedRNNBase, quant_utils.QuantizableLayer):
 
     self.CreateChildren('rnn', rnn_params)
     self.CreateChild('dropout', p.dropout)
+
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     self.TrackQTensor('residual')
 
   def _CreateChildrenVariables(self):
-    # Backwards compatibility: manually call child.CreateVariables() outside of
-    # tf.variable_scope(p.name).
+    # Backwards compatibility: manually call child.InstantiateVariables()
+    # outside of tf.variable_scope(p.name).
     for rnn in self.rnn:
-      rnn.CreateVariables()
-    self.dropout.CreateVariables()
+      rnn.InstantiateVariables()
+    self.dropout.InstantiateVariables()
     super()._CreateChildrenVariables()
 
   def FProp(self, theta, inputs, paddings):
@@ -382,9 +388,9 @@ class FRNN(base_layer.BaseLayer):
     self.CreateChild('cell', p.cell)
 
   def _CreateChildrenVariables(self):
-    # Backwards compatibility: manually call child.CreateVariables() outside of
-    # tf.variable_scope(p.name).
-    self.cell.CreateVariables()
+    # Backwards compatibility: manually call child.InstantiateVariables()
+    # outside of tf.variable_scope(p.name).
+    self.cell.InstantiateVariables()
     super()._CreateChildrenVariables()
 
   @property
@@ -418,7 +424,6 @@ class FRNN(base_layer.BaseLayer):
     rcell = self.cell
     assert isinstance(rcell, (rnn_cell.RNNCell))
 
-    @tf.Defun()
     def FlipUpDown(x):
       # Reverse the first dimension (time)
       return tf.reverse(x, [0])
@@ -506,9 +511,9 @@ class BidirectionalFRNN(base_layer.BaseLayer):
       fwd_device = ''
       bwd_device = ''
     with tf.device(fwd_device):
-      self.fwd_rnn.CreateVariables()
+      self.fwd_rnn.InstantiateVariables()
     with tf.device(bwd_device):
-      self.bak_rnn.CreateVariables()
+      self.bak_rnn.InstantiateVariables()
     super()._CreateChildrenVariables()
 
   def FProp(self, theta, inputs, paddings, segment_id=None):
@@ -607,10 +612,10 @@ class BidirectionalRNN(base_layer.BaseLayer):
     self.CreateChild('bak_rnn', params_backward)
 
   def _CreateChildrenVariables(self):
-    # Backwards compatibility: manually call child.CreateVariables() outside of
-    # tf.variable_scope(p.name).
-    self.fwd_rnn.CreateVariables()
-    self.bak_rnn.CreateVariables()
+    # Backwards compatibility: manually call child.InstantiateVariables()
+    # outside of tf.variable_scope(p.name).
+    self.fwd_rnn.InstantiateVariables()
+    self.bak_rnn.InstantiateVariables()
     super()._CreateChildrenVariables()
 
   def FProp(self, theta, inputs, paddings):
@@ -669,9 +674,9 @@ class BidirectionalRNNV2(base_layer.BaseLayer):
     self.CreateChild('brnn', p)
 
   def _CreateChildrenVariables(self):
-    # Backwards compatibility: manually call child.CreateVariables() outside of
-    # tf.variable_scope(p.name).
-    self.brnn.CreateVariables()
+    # Backwards compatibility: manually call child.InstantiateVariables()
+    # outside of tf.variable_scope(p.name).
+    self.brnn.InstantiateVariables()
     super()._CreateChildrenVariables()
 
   def _PadSequenceToLength(self, t_input, length, pad_value):
@@ -788,10 +793,10 @@ class FRNNWithAttention(base_layer.BaseLayer):
     self.CreateChild('atten', p.attention)
 
   def _CreateChildrenVariables(self):
-    # Backwards compatibility: manually call child.CreateVariables() outside of
-    # tf.variable_scope(p.name).
-    self.cell.CreateVariables()
-    self.atten.CreateVariables()
+    # Backwards compatibility: manually call child.InstantiateVariables()
+    # outside of tf.variable_scope(p.name).
+    self.cell.InstantiateVariables()
+    self.atten.InstantiateVariables()
     super()._CreateChildrenVariables()
 
   @property
@@ -1186,12 +1191,12 @@ class MultiSourceFRNNWithAttention(base_layer.BaseLayer):
     self.CreateChild('atten_merger', params)
 
   def _CreateChildrenVariables(self):
-    # Backwards compatibility: manually call child.CreateVariables() outside of
-    # tf.variable_scope(p.name).
-    self.cell.CreateVariables()
+    # Backwards compatibility: manually call child.InstantiateVariables()
+    # outside of tf.variable_scope(p.name).
+    self.cell.InstantiateVariables()
     for atten in self.attentions:
-      atten.CreateVariables()
-    self.atten_merger.CreateVariables()
+      atten.InstantiateVariables()
+    self.atten_merger.InstantiateVariables()
     super()._CreateChildrenVariables()
 
   def InitAttention(self, theta, src_encs, src_paddings, batch_size):
@@ -1382,10 +1387,10 @@ class BidirectionalFRNNQuasi(base_layer.BaseLayer):
     self.CreateChild('bak_rnn', params_backward)
 
   def _CreateChildrenVariables(self):
-    # Backwards compatibility: manually call child.CreateVariables() outside of
-    # tf.variable_scope(p.name).
-    self.fwd_rnn.CreateVariables()
-    self.bak_rnn.CreateVariables()
+    # Backwards compatibility: manually call child.InstantiateVariables()
+    # outside of tf.variable_scope(p.name).
+    self.fwd_rnn.InstantiateVariables()
+    self.bak_rnn.InstantiateVariables()
     super()._CreateChildrenVariables()
 
   def FProp(self, theta, inputs, paddings):

@@ -154,8 +154,9 @@ def _ComputeConvOutputPaddingV2(paddings,
         padding=padding_algorithm,
         strides=[stride])
   out_paddings = tf.squeeze(out_paddings, -1)
-  if slice_len > 0:
-    out_paddings = out_paddings[:, :-slice_len]
+  if stride > 1:
+    slice_end = py_utils.GetShape(out_paddings)[1] - slice_len
+    out_paddings = out_paddings[:, :slice_end]
   return out_paddings
 
 
@@ -184,7 +185,7 @@ def _PadForLengthCompatibleStridesV2(tensor, stride, padding_algorithm,
 
   input_length = py_utils.GetShape(tensor)[1]
   pad_len = ((input_length // stride) + 1) * stride - 1 - input_length
-  if pad_len == 0 or pad_len == stride:
+  if pad_len == 0:
     return tensor, 0
   tensor = py_utils.PadSequenceDimension(tensor, input_length + pad_len,
                                          constant_values)
@@ -192,7 +193,7 @@ def _PadForLengthCompatibleStridesV2(tensor, stride, padding_algorithm,
 
 
 class BaseConv2DLayerWithPadding(base_layer.BaseLayer):
-  """Base class for 2D convolution layers.
+  """Abstract base class for 2D convolution layers.
 
   WARNING: Strided convolutions are buggy. Prefer using v2_padding=True.
   """
@@ -261,6 +262,10 @@ class BaseConv2DLayerWithPadding(base_layer.BaseLayer):
     """The number of input channels for this conv layer."""
     return self.params.filter_shape[2]
 
+  @property
+  def filter_stride(self):
+    return self.params.filter_stride
+
   def OutShape(self, in_shape):
     """Compute the output shape given the input shape."""
     p = self.params
@@ -306,8 +311,9 @@ class BaseConv2DLayerWithPadding(base_layer.BaseLayer):
         padded_inputs, slice_len = _PadForLengthCompatibleStridesV2(
             inputs, p.filter_stride[0], 'SAME', 0.)
         out = self._ApplyConv(theta, padded_inputs)
-        if slice_len > 0:
-          out = out[:, :-slice_len, :, :]
+        if p.filter_stride[0] > 1:
+          slice_end = py_utils.GetShape(out)[1] - slice_len
+          out = out[:, :slice_end, :, :]
       else:
         out = self._ApplyConv(theta, inputs)
 
@@ -378,8 +384,8 @@ class Conv2DLayerWithPadding(BaseConv2DLayerWithPadding):
     p.Define('bias', False, 'Whether or not to apply a bias before activation.')
     return p
 
-  def _CreateVariables(self):
-    super()._CreateVariables()
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     p = self.params
     w_pc = py_utils.WeightParams(
         shape=p.filter_shape,
@@ -492,8 +498,8 @@ class DepthwiseConv2DLayer(BaseConv2DLayerWithPadding):
     p.Define('bias', False, 'Whether or not to apply a bias before activation.')
     return p
 
-  def _CreateVariables(self):
-    super()._CreateVariables()
+  def _CreateLayerVariables(self):
+    super()._CreateLayerVariables()
     p = self.params
     w_pc = py_utils.WeightParams(
         shape=p.filter_shape,

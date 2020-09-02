@@ -599,8 +599,11 @@ class _Recurrent:
 
   def Compute(self):
     """Run the computation."""
-    run = py_utils.CallDefun(self._forward, self._fwd_args, self._backward,
-                             self._implicit_captures, self._caller_device)
+    run = py_utils.CallDefun(
+        self._forward,
+        self._fwd_args,
+        bak=self._backward,
+        device=self._caller_device)
 
     if self._accumulator_layer:
       # Restore the accumulators from the final recurrent state.
@@ -646,20 +649,32 @@ def _ReflectOnCellFn(cell_fn,
       state0.DeepCopy(), accumulator_layer, allow_overwrite=True)
 
   fwd_sig = [theta, state0, inputs]
+  input_signature = py_utils.Transform(lambda t: tf.TensorSpec(None, t.dtype),
+                                       fwd_sig)
 
-  @tf.Defun(*py_utils.Dtypes(fwd_sig))
+  @py_utils._WrapFunction(input_signature=py_utils.Flatten(input_signature))  # pylint: disable=protected-access
   def Fwd(*args):
+    # tf.function inherits the step seed collection from parent graph, we need
+    # to reset it to mimic Defun's behavior.
+    py_utils.ResetStepSeed()
+
     (theta, state0, inputs) = py_utils.Pack(fwd_sig, args)
     py_utils.SetShapes(theta, fwd_sig[0])
     state1, extras = cell_fn(theta, state0, inputs)
     return py_utils.Flatten([state1, extras])
 
+  # Get the stateful ops used in cell_fn. Logic borrowed from
+  # _EagerDefinedFunction.__init__().
+  input_ops = set(arg.op for arg in Fwd.graph.inputs)
+  operations = [op for op in Fwd.graph.get_operations() if op not in input_ops]
+  stateful_ops = tuple(op for op in operations if op._is_stateful)  # pylint: disable=protected-access
+
   # Asserts about the function.
-  if Fwd.stateful_ops:
+  if stateful_ops:
     if check_stateful_ops:
-      raise ValueError('cell_fn contains stateful ops: %s' % Fwd.stateful_ops)
+      raise ValueError('cell_fn contains stateful ops: %s' % stateful_ops)
     else:
-      tf.logging.warning('cell_fn contains stateful ops: %s', Fwd.stateful_ops)
+      tf.logging.warning('cell_fn contains stateful ops: %s', stateful_ops)
 
   if cluster_factory.Current().job in {'trainer', 'trainer_client'}:
     stateful_random_ops = py_utils.StatefulRandomOpsInDefun(Fwd)
@@ -1400,6 +1415,20 @@ def StackedRecurrent(devices,
       - The last layer's output (accumulated states).
       - The list of final state NestedMap. One for each layer.
   """
+  # Enable rendezvous sharing when using tf.function, since it needs to do
+  # send/recv across function boundary.
+  # pylint: disable=protected-access
+  with py_utils._SharedRendezvousScope(shared_rendezvous=True):
+    return _StackedRecurrent(devices, cell_fns, cell_grads, cell_outs,
+                             cell_out_grads, thetas, init_states, inputs,
+                             accumulator_layers, unused_acc_state)
+  # pylint: enable=protected-access
+
+
+def _StackedRecurrent(devices, cell_fns, cell_grads, cell_outs, cell_out_grads,
+                      thetas, init_states, inputs, accumulator_layers,
+                      unused_acc_state):
+  """Implementation of StackedRecurrent, see StackedRecurrent for details."""
   num_layers = len(devices)
   assert num_layers
 
